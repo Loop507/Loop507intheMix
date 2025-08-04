@@ -58,27 +58,24 @@ def estimate_key_simple(y, sr):
 def analyze_track(audio_file_object):
     audio_file_object.seek(0)
     
-    # Crea un file temporaneo WAV
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav_file:
         audio = AudioSegment.from_file(audio_file_object)
         audio.export(tmp_wav_file.name, format="wav")
         tmp_path = tmp_wav_file.name
 
     try:
-        # Rilevamento BPM con aubio (più preciso)
+        # Rilevamento BPM con aubio
         samplerate = 0
         win_s = 512
         hop_s = win_s // 2
         s = aubio.source(tmp_path, samplerate, hop_s)
         samplerate = s.samplerate
         o = aubio.tempo("default", win_s, hop_s, samplerate)
-        total_frames = 0
         beats = []
         while True:
             samples, read = s()
             if o(samples):
                 beats.append(o.get_last_s())
-            total_frames += read
             if read < hop_s:
                 break
         
@@ -99,7 +96,6 @@ def analyze_track(audio_file_object):
 def process_audio(audio_file_object, new_tempo, pitch_shift):
     audio_file_object.seek(0)
 
-    # Crea un file temporaneo WAV
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav_file:
         audio = AudioSegment.from_file(audio_file_object)
         audio.export(tmp_wav_file.name, format="wav")
@@ -108,11 +104,25 @@ def process_audio(audio_file_object, new_tempo, pitch_shift):
     try:
         y, sr = librosa.load(tmp_path, sr=None)
 
-        # Ricalcolo il tempo originale per la time-stretching
-        onset_env = librosa.onset.onset_detect(y=y, sr=sr)
-        tempo_originale, _ = librosa.beat.beat_track(onset_env=onset_env, sr=sr)
-
-        if tempo_originale == 0: tempo_originale = 120.0
+        # Usiamo il BPM rilevato da aubio per la time-stretching
+        samplerate = 0
+        win_s = 512
+        hop_s = win_s // 2
+        s = aubio.source(tmp_path, samplerate, hop_s)
+        samplerate = s.samplerate
+        o = aubio.tempo("default", win_s, hop_s, samplerate)
+        beats = []
+        while True:
+            samples, read = s()
+            if o(samples):
+                beats.append(o.get_last_s())
+            if read < hop_s:
+                break
+        
+        if len(beats) > 1:
+            tempo_originale = 60. * (len(beats) - 1) / (beats[-1] - beats[0])
+        else:
+            tempo_originale = 120.0
         
         y_stretched = librosa.effects.time_stretch(y=y, rate=new_tempo / tempo_originale)
         y_shifted = librosa.effects.pitch_shift(y=y_stretched, sr=sr, n_steps=pitch_shift)
@@ -129,7 +139,6 @@ def process_audio(audio_file_object, new_tempo, pitch_shift):
         
     finally:
         os.remove(tmp_path)
-
 
 # --- Interfaccia utente con Streamlit ---
 st.title("Loop507 in the Mix")
