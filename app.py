@@ -6,16 +6,19 @@ from io import BytesIO
 import tempfile
 import os
 import random
+import shutil
 
 # --- Funzioni di analisi e manipolazione audio ---
 
+@st.cache_data
 def analyze_track_for_slicing(audio_file_object):
     """
     Analizza un brano per trovare i punti di attacco (onset) e restituisce
     l'audio, il sample rate e gli indici dei punti di attacco.
     """
     audio_file_object.seek(0)
-    
+
+    # Crea una copia temporanea del file caricato
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav_file:
         audio = AudioSegment.from_file(audio_file_object)
         audio.export(tmp_wav_file.name, format="wav")
@@ -24,8 +27,10 @@ def analyze_track_for_slicing(audio_file_object):
     try:
         y, sr = librosa.load(tmp_path, sr=None)
         
+        # Rileva i punti di attacco
         onset_frames = librosa.onset.onset_detect(y=y, sr=sr, units='frames')
         
+        # Stima il BPM per calcolare la durata di una battuta
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
         
         return y, sr, onset_frames, tempo
@@ -34,39 +39,43 @@ def analyze_track_for_slicing(audio_file_object):
         os.remove(tmp_path)
 
 
-def create_loop(y, sr, onset_frames, num_beats):
+def create_loop(y, sr, tempo, num_beats):
     """
-    Crea un loop di N battute basato sui punti di attacco.
+    Crea un loop di N battute.
     """
-    if len(onset_frames) < num_beats:
+    if tempo == 0:
         return y
 
-    tempo, _ = librosa.beat.beat_track(onset_env=onset_frames, sr=sr)
-    frames_per_beat = sr * 60 / tempo
+    # Calcola la durata di un beat in sample
+    samples_per_beat = sr * 60 / tempo
     
-    start_frame = onset_frames[0]
-    end_frame = start_frame + int(frames_per_beat * num_beats)
+    # Inizia il loop dall'inizio del brano
+    start_sample = 0
+    end_sample = int(start_sample + samples_per_beat * num_beats)
     
-    if end_frame > len(y):
-        end_frame = len(y)
+    # Se il loop supera la fine del brano, lo accorcia
+    if end_sample > len(y):
+        end_sample = len(y)
     
-    looped_audio = y[start_frame:end_frame]
+    looped_audio = y[start_sample:end_sample]
     
     return looped_audio
 
 
 def randomize_track(y, sr, onset_frames, tempo):
     """
-    Taglia il brano in segmenti di una battuta e li ricompone in ordine casuale.
+    Taglia il brano in segmenti e li ricompone in ordine casuale.
     """
     frames_per_beat = sr * 60 / tempo
     
     segments = []
+    # Crea segmenti basati sui punti di attacco
     for i in range(len(onset_frames) - 1):
         start_frame = onset_frames[i]
         end_frame = onset_frames[i+1]
         
-        if end_frame - start_frame >= frames_per_beat / 2:
+        # Evita segmenti troppo corti
+        if end_frame - start_frame >= frames_per_beat / 4:
             segments.append(y[start_frame:end_frame])
 
     if not segments:
@@ -89,40 +98,32 @@ def randomize_two_decks(y1, sr1, onsets1, tempo1, y2, sr2, onsets2, tempo2):
     for i in range(len(onsets1) - 1):
         start_frame = onsets1[i]
         end_frame = onsets1[i+1]
-        if end_frame - start_frame >= frames_per_beat1 / 2:
+        if end_frame - start_frame >= frames_per_beat1 / 4:
             segments1.append(y1[start_frame:end_frame])
 
     segments2 = []
     for i in range(len(onsets2) - 1):
         start_frame = onsets2[i]
         end_frame = onsets2[i+1]
-        if end_frame - start_frame >= frames_per_beat2 / 2:
+        if end_frame - start_frame >= frames_per_beat2 / 4:
             segments2.append(y2[start_frame:end_frame])
 
     if not segments1 or not segments2:
-        # Se uno dei due brani non ha segmenti, restituisce il primo
-        return np.concatenate(segments1) if segments1 else y1
+        return None, None
     
     all_segments = segments1 + segments2
     random.shuffle(all_segments)
     
     # Assicura che i sample rate siano uguali prima di unire
     target_sr = sr1
-    mixed_audio = []
     
-    for segment in all_segments:
-        # Resample se i sample rate sono diversi
-        if len(segment) > 0:
-            if len(segment) != int(len(segment) / sr1 * sr2):
-                segment_resampled = librosa.resample(y=segment, orig_sr=sr1, target_sr=target_sr)
-                mixed_audio.append(segment_resampled)
-            else:
-                mixed_audio.append(segment)
-                
-    if not mixed_audio:
-        return y1
+    # Resample i segmenti del secondo brano al sample rate del primo
+    resampled_segments2 = [librosa.resample(y=seg, orig_sr=sr2, target_sr=target_sr) for seg in segments2]
+    
+    all_segments = segments1 + resampled_segments2
+    random.shuffle(all_segments)
         
-    randomized_mashup = np.concatenate(mixed_audio)
+    randomized_mashup = np.concatenate(all_segments)
     
     return randomized_mashup, target_sr
 
@@ -144,7 +145,7 @@ def export_audio(y, sr):
 
 # --- Interfaccia utente con Streamlit ---
 st.title("Loop507 in the Mix: Beat Slicer")
-st.write("Carica un brano e ricomponilo in modo creativo!")
+st.write("Carica un brano o due e ricomponili in modo creativo!")
 
 if 'deck_a' not in st.session_state:
     st.session_state.deck_a = {'file': None, 'y': None, 'sr': None, 'onsets': None, 'tempo': None}
@@ -175,8 +176,6 @@ with col2:
                 st.session_state.deck_b = {'file': uploaded_file_b, 'y': y, 'sr': sr, 'onsets': onsets, 'tempo': tempo}
             st.success(f"Analisi completata! BPM stimato: {tempo:.2f}")
 
----
-
 st.sidebar.header("Controlli Slicing e Ricomposizione")
 
 # Controlli per il Deck A
@@ -186,7 +185,7 @@ if st.session_state.deck_a['file']:
     
     if st.sidebar.button("Crea Loop A", key="create_loop_a"):
         with st.spinner('Creo loop...'):
-            looped_audio = create_loop(st.session_state.deck_a['y'], st.session_state.deck_a['sr'], st.session_state.deck_a['onsets'], num_beats_a)
+            looped_audio = create_loop(st.session_state.deck_a['y'], st.session_state.deck_a['sr'], st.session_state.deck_a['tempo'], num_beats_a)
             processed_audio_buffer = export_audio(looped_audio, st.session_state.deck_a['sr'])
         st.audio(processed_audio_buffer, format="audio/mp3")
         st.download_button("Scarica Loop A", data=processed_audio_buffer, file_name=f"loop_A_{num_beats_a}_beats.mp3", mime="audio/mp3")
@@ -207,7 +206,7 @@ if st.session_state.deck_b['file']:
     
     if st.sidebar.button("Crea Loop B", key="create_loop_b"):
         with st.spinner('Creo loop...'):
-            looped_audio = create_loop(st.session_state.deck_b['y'], st.session_state.deck_b['sr'], st.session_state.deck_b['onsets'], num_beats_b)
+            looped_audio = create_loop(st.session_state.deck_b['y'], st.session_state.deck_b['sr'], st.session_state.deck_b['tempo'], num_beats_b)
             processed_audio_buffer = export_audio(looped_audio, st.session_state.deck_b['sr'])
         st.audio(processed_audio_buffer, format="audio/mp3")
         st.download_button("Scarica Loop B", data=processed_audio_buffer, file_name=f"loop_B_{num_beats_b}_beats.mp3", mime="audio/mp3")
@@ -228,6 +227,9 @@ if st.session_state.deck_a['file'] and st.session_state.deck_b['file']:
                 st.session_state.deck_a['y'], st.session_state.deck_a['sr'], st.session_state.deck_a['onsets'], st.session_state.deck_a['tempo'],
                 st.session_state.deck_b['y'], st.session_state.deck_b['sr'], st.session_state.deck_b['onsets'], st.session_state.deck_b['tempo']
             )
-            processed_audio_buffer = export_audio(mixed_audio, mixed_sr)
-        st.audio(processed_audio_buffer, format="audio/mp3")
-        st.download_button("Scarica Mix Random", data=processed_audio_buffer, file_name="random_mashup.mp3", mime="audio/mp3")
+            if mixed_audio is not None and mixed_sr is not None:
+                processed_audio_buffer = export_audio(mixed_audio, mixed_sr)
+                st.audio(processed_audio_buffer, format="audio/mp3")
+                st.download_button("Scarica Mix Random", data=processed_audio_buffer, file_name="random_mashup.mp3", mime="audio/mp3")
+            else:
+                st.error("Impossibile creare il mashup. Assicurati che entrambi i brani abbiano abbastanza punti di attacco.")
