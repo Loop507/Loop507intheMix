@@ -58,9 +58,11 @@ def estimate_key_simple(y, sr):
 def analyze_track(audio_file_object):
     audio_file_object.seek(0)
     
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
-        tmp_file.write(audio_file_object.getvalue())
-        tmp_path = tmp_file.name
+    # Crea un file temporaneo WAV
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav_file:
+        audio = AudioSegment.from_file(audio_file_object)
+        audio.export(tmp_wav_file.name, format="wav")
+        tmp_path = tmp_wav_file.name
 
     try:
         # Rilevamento BPM con aubio (più preciso)
@@ -97,9 +99,11 @@ def analyze_track(audio_file_object):
 def process_audio(audio_file_object, new_tempo, pitch_shift):
     audio_file_object.seek(0)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
-        tmp_file.write(audio_file_object.getvalue())
-        tmp_path = tmp_file.name
+    # Crea un file temporaneo WAV
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav_file:
+        audio = AudioSegment.from_file(audio_file_object)
+        audio.export(tmp_wav_file.name, format="wav")
+        tmp_path = tmp_wav_file.name
 
     try:
         y, sr = librosa.load(tmp_path, sr=None)
