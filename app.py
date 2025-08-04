@@ -4,6 +4,7 @@ import numpy as np
 from pydub import AudioSegment
 from io import BytesIO
 import tempfile
+import os
 import aubio
 
 # --- Funzioni di supporto per la chiave musicale ---
@@ -45,41 +46,6 @@ def get_pitch_shift(original_key, new_key):
         return shift
     return 0
 
-# --- Funzioni di analisi e manipolazione audio ---
-
-def analyze_track(audio_file_object):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
-        tmp_file.write(audio_file_object.getvalue())
-        tmp_path = tmp_file.name
-
-    # Rilevamento BPM con aubio (più preciso)
-    samplerate = 0
-    win_s = 512
-    hop_s = win_s // 2
-    s = aubio.source(tmp_path, samplerate, hop_s)
-    samplerate = s.samplerate
-    o = aubio.tempo("default", win_s, hop_s, samplerate)
-    total_frames = 0
-    beats = []
-    while True:
-        samples, read = s()
-        if o(samples):
-            beats.append(o.get_last_s())
-        total_frames += read
-        if read < hop_s:
-            break
-    
-    if len(beats) > 1:
-        tempo_val = 60. * (len(beats) - 1) / (beats[-1] - beats[0])
-    else:
-        tempo_val = 120.0
-    
-    # Rilevamento chiave con librosa
-    y, sr = librosa.load(tmp_path, sr=None)
-    key = estimate_key_simple(y, sr)
-    
-    return tempo_val, key
-
 def estimate_key_simple(y, sr):
     chroma = librosa.feature.chroma_stft(y=y, sr=sr)
     chroma_mean = np.mean(chroma, axis=1)
@@ -87,31 +53,79 @@ def estimate_key_simple(y, sr):
     key_notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
     return key_notes[key_idx]
 
-def process_audio(audio_file_object, new_tempo, pitch_shift):
+# --- Funzioni di analisi e manipolazione audio ---
+
+def analyze_track(audio_file_object):
+    audio_file_object.seek(0)
+    
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
         tmp_file.write(audio_file_object.getvalue())
         tmp_path = tmp_file.name
-    
-    y, sr = librosa.load(tmp_path, sr=None)
-    
-    # Ricalcolo il tempo originale per la time-stretching
-    onset_env = librosa.onset.onset_detect(y=y, sr=sr)
-    tempo_originale, _ = librosa.beat.beat_track(onset_env=onset_env, sr=sr)
 
-    if tempo_originale == 0: tempo_originale = 120.0
+    try:
+        # Rilevamento BPM con aubio (più preciso)
+        samplerate = 0
+        win_s = 512
+        hop_s = win_s // 2
+        s = aubio.source(tmp_path, samplerate, hop_s)
+        samplerate = s.samplerate
+        o = aubio.tempo("default", win_s, hop_s, samplerate)
+        total_frames = 0
+        beats = []
+        while True:
+            samples, read = s()
+            if o(samples):
+                beats.append(o.get_last_s())
+            total_frames += read
+            if read < hop_s:
+                break
+        
+        if len(beats) > 1:
+            tempo_val = 60. * (len(beats) - 1) / (beats[-1] - beats[0])
+        else:
+            tempo_val = 120.0
+            
+        # Rilevamento chiave con librosa
+        y, sr = librosa.load(tmp_path, sr=None)
+        key = estimate_key_simple(y, sr)
+        
+        return tempo_val, key
     
-    y_stretched = librosa.effects.time_stretch(y=y, rate=new_tempo / tempo_originale)
-    y_shifted = librosa.effects.pitch_shift(y=y_stretched, sr=sr, n_steps=pitch_shift)
-    buffer = BytesIO()
-    audio_segment = AudioSegment(
-        (y_shifted * 32767).astype(np.int16).tobytes(),
-        frame_rate=sr,
-        sample_width=2,
-        channels=1
-    )
-    audio_segment.export(buffer, format="mp3")
-    buffer.seek(0)
-    return buffer
+    finally:
+        os.remove(tmp_path)
+
+def process_audio(audio_file_object, new_tempo, pitch_shift):
+    audio_file_object.seek(0)
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
+        tmp_file.write(audio_file_object.getvalue())
+        tmp_path = tmp_file.name
+
+    try:
+        y, sr = librosa.load(tmp_path, sr=None)
+
+        # Ricalcolo il tempo originale per la time-stretching
+        onset_env = librosa.onset.onset_detect(y=y, sr=sr)
+        tempo_originale, _ = librosa.beat.beat_track(onset_env=onset_env, sr=sr)
+
+        if tempo_originale == 0: tempo_originale = 120.0
+        
+        y_stretched = librosa.effects.time_stretch(y=y, rate=new_tempo / tempo_originale)
+        y_shifted = librosa.effects.pitch_shift(y=y_stretched, sr=sr, n_steps=pitch_shift)
+        buffer = BytesIO()
+        audio_segment = AudioSegment(
+            (y_shifted * 32767).astype(np.int16).tobytes(),
+            frame_rate=sr,
+            sample_width=2,
+            channels=1
+        )
+        audio_segment.export(buffer, format="mp3")
+        buffer.seek(0)
+        return buffer
+        
+    finally:
+        os.remove(tmp_path)
+
 
 # --- Interfaccia utente con Streamlit ---
 st.title("Loop507 in the Mix")
