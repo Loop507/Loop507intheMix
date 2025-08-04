@@ -64,20 +64,27 @@ def estimate_key_simple(y, sr):
 
 def analyze_track(audio_file_object):
     """Analizza un file audio per BPM e chiave musicale."""
-    audio_file_object.seek(0) # <--- Aggiunta questa riga
+    audio_file_object.seek(0)
     y, sr = librosa.load(audio_file_object, sr=None)
-    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+    
+    # Utilizzo un metodo più robusto per il rilevamento del BPM
+    onset_env = librosa.onset.onset_detect(y=y, sr=sr)
+    tempo, _ = librosa.beat.beat_track(onset_env=onset_env, sr=sr)
     tempo_val = tempo.item()
+    
     key = estimate_key_simple(y, sr)
     return tempo_val, key
 
 def process_audio(audio_file_object, new_tempo, pitch_shift):
     """Modifica il tempo e l'intonazione del file audio."""
-    audio_file_object.seek(0) # <--- Aggiunta questa riga
+    audio_file_object.seek(0)
     y, sr = librosa.load(audio_file_object, sr=None)
-    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-    if tempo == 0: tempo = 120.0
-    y_stretched = librosa.effects.time_stretch(y=y, rate=new_tempo / tempo)
+    
+    # Il tempo originale viene ricalcolato per coerenza
+    tempo_originale, _ = librosa.beat.beat_track(y=y, sr=sr)
+    if tempo_originale == 0: tempo_originale = 120.0
+    
+    y_stretched = librosa.effects.time_stretch(y=y, rate=new_tempo / tempo_originale)
     y_shifted = librosa.effects.pitch_shift(y=y_stretched, sr=sr, n_steps=pitch_shift)
     buffer = BytesIO()
     audio_segment = AudioSegment(
