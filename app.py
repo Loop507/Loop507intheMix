@@ -6,6 +6,7 @@ from io import BytesIO
 
 # --- Funzioni di supporto per la chiave musicale ---
 
+# Mappatura Camelot per la visualizzazione
 CAMELOT_MAP = {
     'C': '8B', 'Am': '8A', 'G': '9B', 'Em': '9A',
     'D': '10B', 'Bm': '10A', 'A': '11B', 'F#m': '11A',
@@ -15,6 +16,7 @@ CAMELOT_MAP = {
     'Bb': '6B', 'Gm': '6A', 'F': '7B', 'Dm': '7A'
 }
 
+# Mappatura semitoni per il pitch shifting
 SEMITONES_MAP = {
     'C': 0, 'C#': 1, 'Db': 1, 'D': 2, 'D#': 3, 'Eb': 3, 'E': 4,
     'F': 5, 'F#': 6, 'Gb': 6, 'G': 7, 'G#': 8, 'Ab': 8, 'A': 9,
@@ -24,8 +26,7 @@ SEMITONES_MAP = {
 
 def get_camelot_key(key):
     """Converte una chiave musicale standard in chiave Camelot."""
-    simple_key = key.split(':')[0]
-    return CAMELOT_MAP.get(simple_key, 'Unknown')
+    return CAMELOT_MAP.get(key, 'Unknown')
 
 def get_standard_key(camelot_key):
     """Converte una chiave di Camelot in chiave standard."""
@@ -36,8 +37,8 @@ def get_standard_key(camelot_key):
 
 def get_pitch_shift(original_key, new_key):
     """Calcola il pitch shift in semitoni tra due chiavi standard."""
-    if original_key.split(':')[0] in SEMITONES_MAP and new_key in SEMITONES_MAP:
-        orig_semitones = SEMITONES_MAP[original_key.split(':')[0]]
+    if original_key in SEMITONES_MAP and new_key in SEMITONES_MAP:
+        orig_semitones = SEMITONES_MAP[original_key]
         new_semitones = SEMITONES_MAP[new_key]
         shift = new_semitones - orig_semitones
         if shift > 6:
@@ -47,6 +48,18 @@ def get_pitch_shift(original_key, new_key):
         return shift
     return 0
 
+def estimate_key_simple(y, sr):
+    """Stima la chiave musicale usando un metodo più robusto."""
+    chroma = librosa.feature.chroma_stft(y=y, sr=sr)
+    chroma_mean = np.mean(chroma, axis=1)
+    
+    # Rilevamento della chiave dominante
+    key_idx = np.argmax(chroma_mean)
+    
+    # Mappatura da indice a nota
+    key_notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+    return key_notes[key_idx]
+
 # --- Funzioni di analisi e manipolazione audio ---
 
 def analyze_track(audio_file):
@@ -54,7 +67,7 @@ def analyze_track(audio_file):
     y, sr = librosa.load(audio_file)
     tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
     tempo_val = tempo.item()
-    key = librosa.key_to_note(librosa.feature.chroma_stft(y=y, sr=sr))
+    key = estimate_key_simple(y, sr)
     return tempo_val, key
 
 def process_audio(audio_file, new_tempo, pitch_shift):
@@ -80,17 +93,16 @@ st.title("Loop507 in the Mix")
 st.write("Carica due brani, analizzali e sincronizzali per un missaggio perfetto!")
 st.info("I brani vengono elaborati sul server, l'operazione potrebbe richiedere qualche secondo.")
 
-# Utilizza lo stato della sessione per mantenere i dati dei brani
 if 'deck_a' not in st.session_state:
-    st.session_state.deck_a = {'tempo': 0, 'key': 'C:maj', 'file': None}
+    st.session_state.deck_a = {'tempo': 0, 'key': 'C', 'file': None}
 if 'deck_b' not in st.session_state:
-    st.session_state.deck_b = {'tempo': 0, 'key': 'C:maj', 'file': None}
+    st.session_state.deck_b = {'tempo': 0, 'key': 'C', 'file': None}
 
 col1, col2 = st.columns(2)
 
 with col1:
     st.header("Deck A")
-    uploaded_file_a = st.file_uploader("Carica Brano A", type=["mp3", "wav"])
+    uploaded_file_a = st.file_uploader("Carica Brano A", type=["mp3", "wav"], key="uploader_a")
     if uploaded_file_a:
         st.audio(uploaded_file_a, format='audio/mp3')
         if uploaded_file_a != st.session_state.deck_a['file']:
@@ -104,7 +116,7 @@ with col1:
 
 with col2:
     st.header("Deck B")
-    uploaded_file_b = st.file_uploader("Carica Brano B", type=["mp3", "wav"])
+    uploaded_file_b = st.file_uploader("Carica Brano B", type=["mp3", "wav"], key="uploader_b")
     if uploaded_file_b:
         st.audio(uploaded_file_b, format='audio/mp3')
         if uploaded_file_b != st.session_state.deck_b['file']:
@@ -118,36 +130,35 @@ with col2:
 
 st.sidebar.header("Controlli Brano A")
 if st.session_state.deck_a['file']:
-    new_tempo_a = st.sidebar.slider("BPM (Brano A)", min_value=50.0, max_value=200.0, value=float(st.session_state.deck_a['tempo']), step=0.1)
-    
+    new_tempo_a = st.sidebar.slider("BPM (Brano A)", min_value=50.0, max_value=200.0, value=float(st.session_state.deck_a['tempo']), step=0.1, key="bpm_a")
     all_camelot_keys = sorted(list(CAMELOT_MAP.values()))
     current_key_a = get_camelot_key(st.session_state.deck_a['key'])
-    new_camelot_key_a = st.sidebar.selectbox("Chiave (Brano A)", all_camelot_keys, index=all_camelot_keys.index(current_key_a))
-    
-    if st.sidebar.button("Applica a Brano A"):
+    new_camelot_key_a = st.sidebar.selectbox("Chiave (Brano A)", all_camelot_keys, index=all_camelot_keys.index(current_key_a) if current_key_a in all_camelot_keys else 0, key="key_a")
+    if st.sidebar.button("Applica a Brano A", key="apply_a"):
         new_key_standard = get_standard_key(new_camelot_key_a)
         pitch_shift = get_pitch_shift(st.session_state.deck_a['key'], new_key_standard)
         with st.spinner('Elaboro Brano A...'):
             processed_audio_buffer = process_audio(st.session_state.deck_a['file'], new_tempo_a, pitch_shift)
         st.success("Modifiche applicate a Brano A!")
         st.audio(processed_audio_buffer, format="audio/mp3")
-        st.download_button("Scarica Brano A", data=processed_audio_buffer, file_name=f"mixed_A.mp3", mime="audio/mp3")
+        st.download_button("Scarica Brano A", data=processed_audio_buffer, file_name=f"mixed_A.mp3", mime="audio/mp3", key="download_a")
 
 st.sidebar.header("Controlli Brano B")
 if st.session_state.deck_b['file']:
-    new_tempo_b = st.sidebar.slider("BPM (Brano B)", min_value=50.0, max_value=200.0, value=float(st.session_state.deck_b['tempo']), step=0.1)
-
+    new_tempo_b = st.sidebar.slider("BPM (Brano B)", min_value=50.0, max_value=200.0, value=float(st.session_state.deck_b['tempo']), step=0.1, key="bpm_b")
     all_camelot_keys = sorted(list(CAMELOT_MAP.values()))
     current_key_b = get_camelot_key(st.session_state.deck_b['key'])
-    new_camelot_key_b = st.sidebar.selectbox("Chiave (Brano B)", all_camelot_keys, index=all_camelot_keys.index(current_key_b))
-
-    if st.sidebar.button("Sincronizza B su A"):
-        new_tempo_b = st.session_state.deck_a['tempo']
-        new_key_standard = st.session_state.deck_a['key']
-        pitch_shift = get_pitch_shift(st.session_state.deck_b['key'], new_key_standard)
-        with st.spinner('Sincronizzo Brano B...'):
-            processed_audio_buffer = process_audio(st.session_state.deck_b['file'], new_tempo_b, pitch_shift)
-        st.success("Brano B sincronizzato!")
-        st.audio(processed_audio_buffer, format="audio/mp3")
-        st.download_button("Scarica Brano B Sincronizzato", data=processed_audio_buffer, file_name=f"mixed_B_sync.mp3", mime="audio/mp3")
-        st.sidebar.write("BPM e chiave di Brano B sono stati allineati a Brano A.")
+    new_camelot_key_b = st.sidebar.selectbox("Chiave (Brano B)", all_camelot_keys, index=all_camelot_keys.index(current_key_b) if current_key_b in all_camelot_keys else 0, key="key_b")
+    if st.sidebar.button("Sincronizza B su A", key="sync_b"):
+        if st.session_state.deck_a['file']:
+            new_tempo_b_sync = st.session_state.deck_a['tempo']
+            new_key_standard = st.session_state.deck_a['key']
+            pitch_shift = get_pitch_shift(st.session_state.deck_b['key'], new_key_standard)
+            with st.spinner('Sincronizzo Brano B...'):
+                processed_audio_buffer = process_audio(st.session_state.deck_b['file'], new_tempo_b_sync, pitch_shift)
+            st.success("Brano B sincronizzato!")
+            st.audio(processed_audio_buffer, format="audio/mp3")
+            st.download_button("Scarica Brano B Sincronizzato", data=processed_audio_buffer, file_name=f"mixed_B_sync.mp3", mime="audio/mp3", key="download_sync_b")
+            st.sidebar.write("BPM e chiave di Brano B sono stati allineati a Brano A.")
+        else:
+            st.sidebar.warning("Devi prima caricare il Brano A per la sincronizzazione!")
