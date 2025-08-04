@@ -5,57 +5,15 @@ from pydub import AudioSegment
 from io import BytesIO
 import tempfile
 import os
-import aubio
-
-# --- Funzioni di supporto per la chiave musicale ---
-
-CAMELOT_MAP = {
-    'C': '8B', 'Am': '8A', 'G': '9B', 'Em': '9A',
-    'D': '10B', 'Bm': '10A', 'A': '11B', 'F#m': '11A',
-    'E': '12B', 'C#m': '12A', 'B': '1B', 'G#m': '1A',
-    'F#': '2B', 'D#m': '2A', 'Db': '3B', 'Bbm': '3A',
-    'Ab': '4B', 'Fm': '4A', 'Eb': '5B', 'Cm': '5A',
-    'Bb': '6B', 'Gm': '6A', 'F': '7B', 'Dm': '7A'
-}
-
-SEMITONES_MAP = {
-    'C': 0, 'C#': 1, 'Db': 1, 'D': 2, 'D#': 3, 'Eb': 3, 'E': 4,
-    'F': 5, 'F#': 6, 'Gb': 6, 'G': 7, 'G#': 8, 'Ab': 8, 'A': 9,
-    'A#': 10, 'Bb': 10, 'B': 11, 'Am': 9, 'Bm': 11, 'Em': 4, 'Fm': 5,
-    'Gm': 7, 'C#m': 1, 'D#m': 3, 'F#m': 6, 'G#m': 8, 'Bbm': 10
-}
-
-def get_camelot_key(key):
-    return CAMELOT_MAP.get(key, 'Unknown')
-
-def get_standard_key(camelot_key):
-    for standard_key, camelot_val in CAMELOT_MAP.items():
-        if camelot_val == camelot_key:
-            return standard_key
-    return 'C'
-
-def get_pitch_shift(original_key, new_key):
-    if original_key in SEMITONES_MAP and new_key in SEMITONES_MAP:
-        orig_semitones = SEMITONES_MAP[original_key]
-        new_semitones = SEMITONES_MAP[new_key]
-        shift = new_semitones - orig_semitones
-        if shift > 6:
-            shift -= 12
-        elif shift < -6:
-            shift += 12
-        return shift
-    return 0
-
-def estimate_key_simple(y, sr):
-    chroma = librosa.feature.chroma_stft(y=y, sr=sr)
-    chroma_mean = np.mean(chroma, axis=1)
-    key_idx = np.argmax(chroma_mean)
-    key_notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-    return key_notes[key_idx]
+import random
 
 # --- Funzioni di analisi e manipolazione audio ---
 
-def analyze_track(audio_file_object):
+def analyze_track_for_slicing(audio_file_object):
+    """
+    Analizza un brano per trovare i punti di attacco (onset) e restituisce
+    l'audio, il sample rate e gli indici dei punti di attacco.
+    """
     audio_file_object.seek(0)
     
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav_file:
@@ -64,91 +22,134 @@ def analyze_track(audio_file_object):
         tmp_path = tmp_wav_file.name
 
     try:
-        # Rilevamento BPM con aubio
-        samplerate = 0
-        win_s = 512
-        hop_s = win_s // 2
-        s = aubio.source(tmp_path, samplerate, hop_s)
-        samplerate = s.samplerate
-        o = aubio.tempo("default", win_s, hop_s, samplerate)
-        beats = []
-        while True:
-            samples, read = s()
-            if o(samples):
-                beats.append(o.get_last_s())
-            if read < hop_s:
-                break
-        
-        if len(beats) > 1:
-            tempo_val = 60. * (len(beats) - 1) / (beats[-1] - beats[0])
-        else:
-            tempo_val = 120.0
-            
-        # Rilevamento chiave con librosa
         y, sr = librosa.load(tmp_path, sr=None)
-        key = estimate_key_simple(y, sr)
         
-        return tempo_val, key
+        onset_frames = librosa.onset.onset_detect(y=y, sr=sr, units='frames')
+        
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        
+        return y, sr, onset_frames, tempo
     
     finally:
         os.remove(tmp_path)
 
-def process_audio(audio_file_object, new_tempo, pitch_shift):
-    audio_file_object.seek(0)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav_file:
-        audio = AudioSegment.from_file(audio_file_object)
-        audio.export(tmp_wav_file.name, format="wav")
-        tmp_path = tmp_wav_file.name
+def create_loop(y, sr, onset_frames, num_beats):
+    """
+    Crea un loop di N battute basato sui punti di attacco.
+    """
+    if len(onset_frames) < num_beats:
+        return y
 
-    try:
-        y, sr = librosa.load(tmp_path, sr=None)
+    tempo, _ = librosa.beat.beat_track(onset_env=onset_frames, sr=sr)
+    frames_per_beat = sr * 60 / tempo
+    
+    start_frame = onset_frames[0]
+    end_frame = start_frame + int(frames_per_beat * num_beats)
+    
+    if end_frame > len(y):
+        end_frame = len(y)
+    
+    looped_audio = y[start_frame:end_frame]
+    
+    return looped_audio
 
-        # Usiamo il BPM rilevato da aubio per la time-stretching
-        samplerate = 0
-        win_s = 512
-        hop_s = win_s // 2
-        s = aubio.source(tmp_path, samplerate, hop_s)
-        samplerate = s.samplerate
-        o = aubio.tempo("default", win_s, hop_s, samplerate)
-        beats = []
-        while True:
-            samples, read = s()
-            if o(samples):
-                beats.append(o.get_last_s())
-            if read < hop_s:
-                break
+
+def randomize_track(y, sr, onset_frames, tempo):
+    """
+    Taglia il brano in segmenti di una battuta e li ricompone in ordine casuale.
+    """
+    frames_per_beat = sr * 60 / tempo
+    
+    segments = []
+    for i in range(len(onset_frames) - 1):
+        start_frame = onset_frames[i]
+        end_frame = onset_frames[i+1]
         
-        if len(beats) > 1:
-            tempo_originale = 60. * (len(beats) - 1) / (beats[-1] - beats[0])
-        else:
-            tempo_originale = 120.0
+        if end_frame - start_frame >= frames_per_beat / 2:
+            segments.append(y[start_frame:end_frame])
+
+    if not segments:
+        return y
+    
+    random.shuffle(segments)
+    
+    randomized_audio = np.concatenate(segments)
+    
+    return randomized_audio
+
+def randomize_two_decks(y1, sr1, onsets1, tempo1, y2, sr2, onsets2, tempo2):
+    """
+    Mescola segmenti di due brani in modo casuale.
+    """
+    frames_per_beat1 = sr1 * 60 / tempo1
+    frames_per_beat2 = sr2 * 60 / tempo2
+    
+    segments1 = []
+    for i in range(len(onsets1) - 1):
+        start_frame = onsets1[i]
+        end_frame = onsets1[i+1]
+        if end_frame - start_frame >= frames_per_beat1 / 2:
+            segments1.append(y1[start_frame:end_frame])
+
+    segments2 = []
+    for i in range(len(onsets2) - 1):
+        start_frame = onsets2[i]
+        end_frame = onsets2[i+1]
+        if end_frame - start_frame >= frames_per_beat2 / 2:
+            segments2.append(y2[start_frame:end_frame])
+
+    if not segments1 or not segments2:
+        # Se uno dei due brani non ha segmenti, restituisce il primo
+        return np.concatenate(segments1) if segments1 else y1
+    
+    all_segments = segments1 + segments2
+    random.shuffle(all_segments)
+    
+    # Assicura che i sample rate siano uguali prima di unire
+    target_sr = sr1
+    mixed_audio = []
+    
+    for segment in all_segments:
+        # Resample se i sample rate sono diversi
+        if len(segment) > 0:
+            if len(segment) != int(len(segment) / sr1 * sr2):
+                segment_resampled = librosa.resample(y=segment, orig_sr=sr1, target_sr=target_sr)
+                mixed_audio.append(segment_resampled)
+            else:
+                mixed_audio.append(segment)
+                
+    if not mixed_audio:
+        return y1
         
-        y_stretched = librosa.effects.time_stretch(y=y, rate=new_tempo / tempo_originale)
-        y_shifted = librosa.effects.pitch_shift(y=y_stretched, sr=sr, n_steps=pitch_shift)
-        buffer = BytesIO()
-        audio_segment = AudioSegment(
-            (y_shifted * 32767).astype(np.int16).tobytes(),
-            frame_rate=sr,
-            sample_width=2,
-            channels=1
-        )
-        audio_segment.export(buffer, format="mp3")
-        buffer.seek(0)
-        return buffer
-        
-    finally:
-        os.remove(tmp_path)
+    randomized_mashup = np.concatenate(mixed_audio)
+    
+    return randomized_mashup, target_sr
+
+
+def export_audio(y, sr):
+    """
+    Esporta l'audio processato in un buffer MP3.
+    """
+    buffer = BytesIO()
+    audio_segment = AudioSegment(
+        (y * 32767).astype(np.int16).tobytes(),
+        frame_rate=sr,
+        sample_width=2,
+        channels=1
+    )
+    audio_segment.export(buffer, format="mp3")
+    buffer.seek(0)
+    return buffer
 
 # --- Interfaccia utente con Streamlit ---
-st.title("Loop507 in the Mix")
-st.write("Carica due brani, analizzali e sincronizzali per un missaggio perfetto!")
-st.info("I brani vengono elaborati sul server, l'operazione potrebbe richiedere qualche secondo.")
+st.title("Loop507 in the Mix: Beat Slicer")
+st.write("Carica un brano e ricomponilo in modo creativo!")
 
 if 'deck_a' not in st.session_state:
-    st.session_state.deck_a = {'tempo': 0, 'key': 'C', 'file': None}
+    st.session_state.deck_a = {'file': None, 'y': None, 'sr': None, 'onsets': None, 'tempo': None}
 if 'deck_b' not in st.session_state:
-    st.session_state.deck_b = {'tempo': 0, 'key': 'C', 'file': None}
+    st.session_state.deck_b = {'file': None, 'y': None, 'sr': None, 'onsets': None, 'tempo': None}
 
 col1, col2 = st.columns(2)
 
@@ -158,13 +159,10 @@ with col1:
     if uploaded_file_a:
         st.audio(uploaded_file_a, format='audio/mp3')
         if uploaded_file_a != st.session_state.deck_a['file']:
-            with st.spinner('Analizzo Brano A...'):
-                tempo_val, key_val = analyze_track(uploaded_file_a)
-                st.session_state.deck_a['tempo'] = tempo_val
-                st.session_state.deck_a['key'] = key_val
-                st.session_state.deck_a['file'] = uploaded_file_a
-        st.write(f"**BPM:** {st.session_state.deck_a['tempo']:.2f}")
-        st.write(f"**Chiave Camelot:** {get_camelot_key(st.session_state.deck_a['key'])}")
+            with st.spinner('Analizzo il brano...'):
+                y, sr, onsets, tempo = analyze_track_for_slicing(uploaded_file_a)
+                st.session_state.deck_a = {'file': uploaded_file_a, 'y': y, 'sr': sr, 'onsets': onsets, 'tempo': tempo}
+            st.success(f"Analisi completata! BPM stimato: {tempo:.2f}")
 
 with col2:
     st.header("Deck B")
@@ -172,45 +170,64 @@ with col2:
     if uploaded_file_b:
         st.audio(uploaded_file_b, format='audio/mp3')
         if uploaded_file_b != st.session_state.deck_b['file']:
-            with st.spinner('Analizzo Brano B...'):
-                tempo_val, key_val = analyze_track(uploaded_file_b)
-                st.session_state.deck_b['tempo'] = tempo_val
-                st.session_state.deck_b['key'] = key_val
-                st.session_state.deck_b['file'] = uploaded_file_b
-        st.write(f"**BPM:** {st.session_state.deck_b['tempo']:.2f}")
-        st.write(f"**Chiave Camelot:** {get_camelot_key(st.session_state.deck_b['key'])}")
+            with st.spinner('Analizzo il brano...'):
+                y, sr, onsets, tempo = analyze_track_for_slicing(uploaded_file_b)
+                st.session_state.deck_b = {'file': uploaded_file_b, 'y': y, 'sr': sr, 'onsets': onsets, 'tempo': tempo}
+            st.success(f"Analisi completata! BPM stimato: {tempo:.2f}")
 
-st.sidebar.header("Controlli Brano A")
+---
+
+st.sidebar.header("Controlli Slicing e Ricomposizione")
+
+# Controlli per il Deck A
 if st.session_state.deck_a['file']:
-    new_tempo_a = st.sidebar.slider("BPM (Brano A)", min_value=50.0, max_value=200.0, value=float(st.session_state.deck_a['tempo']), step=0.1, key="bpm_a")
-    all_camelot_keys = sorted(list(CAMELOT_MAP.values()))
-    current_key_a = get_camelot_key(st.session_state.deck_a['key'])
-    new_camelot_key_a = st.sidebar.selectbox("Chiave (Brano A)", all_camelot_keys, index=all_camelot_keys.index(current_key_a) if current_key_a in all_camelot_keys else 0, key="key_a")
-    if st.sidebar.button("Applica a Brano A", key="apply_a"):
-        new_key_standard = get_standard_key(new_camelot_key_a)
-        pitch_shift = get_pitch_shift(st.session_state.deck_a['key'], new_key_standard)
-        with st.spinner('Elaboro Brano A...'):
-            processed_audio_buffer = process_audio(st.session_state.deck_a['file'], new_tempo_a, pitch_shift)
-        st.success("Modifiche applicate a Brano A!")
+    st.sidebar.subheader("Brano A")
+    num_beats_a = st.sidebar.selectbox("Loop (battute)", [1, 2, 3, 4, 8], key="loop_a")
+    
+    if st.sidebar.button("Crea Loop A", key="create_loop_a"):
+        with st.spinner('Creo loop...'):
+            looped_audio = create_loop(st.session_state.deck_a['y'], st.session_state.deck_a['sr'], st.session_state.deck_a['onsets'], num_beats_a)
+            processed_audio_buffer = export_audio(looped_audio, st.session_state.deck_a['sr'])
         st.audio(processed_audio_buffer, format="audio/mp3")
-        st.download_button("Scarica Brano A", data=processed_audio_buffer, file_name=f"mixed_A.mp3", mime="audio/mp3", key="download_a")
+        st.download_button("Scarica Loop A", data=processed_audio_buffer, file_name=f"loop_A_{num_beats_a}_beats.mp3", mime="audio/mp3")
 
-st.sidebar.header("Controlli Brano B")
+    if not st.session_state.deck_b['file'] and st.sidebar.button("Crea Random A", key="random_a_solo"):
+        with st.spinner('Ricomponendo il brano...'):
+            randomized_audio = randomize_track(st.session_state.deck_a['y'], st.session_state.deck_a['sr'], st.session_state.deck_a['onsets'], st.session_state.deck_a['tempo'])
+            processed_audio_buffer = export_audio(randomized_audio, st.session_state.deck_a['sr'])
+        st.audio(processed_audio_buffer, format="audio/mp3")
+        st.download_button("Scarica Random A", data=processed_audio_buffer, file_name=f"random_A.mp3", mime="audio/mp3")
+
+st.sidebar.write("---")
+
+# Controlli per il Deck B
 if st.session_state.deck_b['file']:
-    new_tempo_b = st.sidebar.slider("BPM (Brano B)", min_value=50.0, max_value=200.0, value=float(st.session_state.deck_b['tempo']), step=0.1, key="bpm_b")
-    all_camelot_keys = sorted(list(CAMELOT_MAP.values()))
-    current_key_b = get_camelot_key(st.session_state.deck_b['key'])
-    new_camelot_key_b = st.sidebar.selectbox("Chiave (Brano B)", all_camelot_keys, index=all_camelot_keys.index(current_key_b) if current_key_b in all_camelot_keys else 0, key="key_b")
-    if st.sidebar.button("Sincronizza B su A", key="sync_b"):
-        if st.session_state.deck_a['file']:
-            new_tempo_b_sync = st.session_state.deck_a['tempo']
-            new_key_standard = st.session_state.deck_a['key']
-            pitch_shift = get_pitch_shift(st.session_state.deck_b['key'], new_key_standard)
-            with st.spinner('Sincronizzo Brano B...'):
-                processed_audio_buffer = process_audio(st.session_state.deck_b['file'], new_tempo_b_sync, pitch_shift)
-            st.success("Brano B sincronizzato!")
-            st.audio(processed_audio_buffer, format="audio/mp3")
-            st.download_button("Scarica Brano B Sincronizzato", data=processed_audio_buffer, file_name=f"mixed_B_sync.mp3", mime="audio/mp3", key="download_sync_b")
-            st.sidebar.write("BPM e chiave di Brano B sono stati allineati a Brano A.")
-        else:
-            st.sidebar.warning("Devi prima caricare il Brano A per la sincronizzazione!")
+    st.sidebar.subheader("Brano B")
+    num_beats_b = st.sidebar.selectbox("Loop (battute)", [1, 2, 3, 4, 8], key="loop_b")
+    
+    if st.sidebar.button("Crea Loop B", key="create_loop_b"):
+        with st.spinner('Creo loop...'):
+            looped_audio = create_loop(st.session_state.deck_b['y'], st.session_state.deck_b['sr'], st.session_state.deck_b['onsets'], num_beats_b)
+            processed_audio_buffer = export_audio(looped_audio, st.session_state.deck_b['sr'])
+        st.audio(processed_audio_buffer, format="audio/mp3")
+        st.download_button("Scarica Loop B", data=processed_audio_buffer, file_name=f"loop_B_{num_beats_b}_beats.mp3", mime="audio/mp3")
+
+    if not st.session_state.deck_a['file'] and st.sidebar.button("Crea Random B", key="random_b_solo"):
+        with st.spinner('Ricomponendo il brano...'):
+            randomized_audio = randomize_track(st.session_state.deck_b['y'], st.session_state.deck_b['sr'], st.session_state.deck_b['onsets'], st.session_state.deck_b['tempo'])
+            processed_audio_buffer = export_audio(randomized_audio, st.session_state.deck_b['sr'])
+        st.audio(processed_audio_buffer, format="audio/mp3")
+        st.download_button("Scarica Random B", data=processed_audio_buffer, file_name=f"random_B.mp3", mime="audio/mp3")
+
+# Funzione per mescolare due brani
+if st.session_state.deck_a['file'] and st.session_state.deck_b['file']:
+    st.sidebar.subheader("Mashup a Due Deck")
+    if st.sidebar.button("Crea Random Mix", key="random_mashup"):
+        with st.spinner('Ricomponendo il mix...'):
+            mixed_audio, mixed_sr = randomize_two_decks(
+                st.session_state.deck_a['y'], st.session_state.deck_a['sr'], st.session_state.deck_a['onsets'], st.session_state.deck_a['tempo'],
+                st.session_state.deck_b['y'], st.session_state.deck_b['sr'], st.session_state.deck_b['onsets'], st.session_state.deck_b['tempo']
+            )
+            processed_audio_buffer = export_audio(mixed_audio, mixed_sr)
+        st.audio(processed_audio_buffer, format="audio/mp3")
+        st.download_button("Scarica Mix Random", data=processed_audio_buffer, file_name="random_mashup.mp3", mime="audio/mp3")
