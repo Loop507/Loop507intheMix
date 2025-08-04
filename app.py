@@ -1,5 +1,6 @@
 import streamlit as st
 import librosa
+import librosa.display
 import numpy as np
 from pydub import AudioSegment
 from io import BytesIO
@@ -16,8 +17,6 @@ def get_camelot_key(key):
         'Ab': '4B', 'Fm': '4A', 'Eb': '5B', 'Cm': '5A',
         'Bb': '6B', 'Gm': '6A', 'F': '7B', 'Dm': '7A'
     }
-    # La chiave di librosa può avere formati come 'C:maj' o 'Am:min'
-    # Usiamo solo la nota e la tonalità (es. 'C' o 'Am')
     simple_key = key.split(':')[0]
     return camelot_map.get(simple_key, 'Unknown')
 
@@ -29,7 +28,9 @@ def analyze_track(audio_file):
     tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
 
     # Rilevamento chiave
-    key = librosa.key_to_text(librosa.key_to_note(librosa.feature.chroma_stft(y=y, sr=sr)))
+    # Questo metodo usa la funzione di rilevamento della chiave principale di librosa
+    # ed è più affidabile.
+    key = librosa.key_to_note(librosa.feature.chroma_cqt(y=y, sr=sr).mean(axis=1))
     
     return tempo, key
 
@@ -37,11 +38,11 @@ def process_audio(audio_file, new_tempo, new_pitch):
     """Modifica il tempo e l'intonazione del file audio."""
     y, sr = librosa.load(audio_file)
 
-    # Time-stretching (cambia il tempo senza cambiare l'intonazione)
+    # Time-stretching
     tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
     y_stretched = librosa.effects.time_stretch(y=y, rate=new_tempo / tempo)
 
-    # Pitch-shifting (cambia l'intonazione)
+    # Pitch-shifting
     y_shifted = librosa.effects.pitch_shift(y=y_stretched, sr=sr, n_steps=new_pitch)
 
     # Salvataggio in un buffer in memoria
