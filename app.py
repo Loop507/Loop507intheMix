@@ -217,7 +217,7 @@ if active_decks_data:
                 
                 all_raw_segments = []
                 for deck_name, deck_data in active_decks_data:
-                    if deck_data['y'] is not None and deck_data['tempo'] is not None and deck_data['tempo'] > 0:
+                    if deck_data['y'] is not None and isinstance(deck_data['y'], np.ndarray) and deck_data['y'].ndim > 0 and deck_data['tempo'] is not None and deck_data['tempo'] > 0:
                         y_to_process = deck_data['y']
                         sr_to_process = deck_data['sr']
                         current_tempo = deck_data['tempo']
@@ -227,7 +227,6 @@ if active_decks_data:
                             stretch_factor = current_tempo / master_tempo
                             y_to_process = librosa.effects.time_stretch(y_to_process, rate=stretch_factor)
                             
-                        # Passa il tempo corretto a get_beat_segments
                         tempo_for_segments = master_tempo if master_tempo else current_tempo
                         segments = get_beat_segments(y_to_process, sr_to_process, tempo_for_segments, 1)
                         all_raw_segments.extend([(seg, sr_to_process) for seg in segments])
