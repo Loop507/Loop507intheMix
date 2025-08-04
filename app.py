@@ -195,24 +195,49 @@ if active_decks_data:
             st.sidebar.warning("Devi decomporre i brani prima di usare questa opzione.")
     
     if recomposition_mode == "Mix Casuale Completo":
+        st.sidebar.subheader("Controlli Avanzati")
+        master_deck_options = ["Nessuno (default)"] + [deck[0] for deck in active_decks_data]
+        master_deck_selection = st.sidebar.selectbox("Scegli il Deck Master per la sincronizzazione del tempo", options=master_deck_options)
+        
         st.sidebar.subheader("Controllo Durata del Mix")
         st.sidebar.write("La durata standard suggerita per un mix è di 60 secondi.")
         desired_duration = st.sidebar.number_input("Durata desiderata del mix (in secondi)", min_value=1.0, value=60.0, step=1.0)
         
         if st.sidebar.button("Crea Mix Casuale Completo"):
             with st.spinner('Creazione del brano ricomposto...'):
+                master_tempo = None
+                if master_deck_selection != "Nessuno (default)":
+                    for deck_name, deck_data in active_decks_data:
+                        if deck_name == master_deck_selection:
+                            master_tempo = deck_data['tempo']
+                            break
+                
                 all_raw_segments = []
                 for deck_name, deck_data in active_decks_data:
                     if deck_data['y'] is not None and deck_data['tempo'] is not None and deck_data['tempo'] > 0:
-                        segments = get_beat_segments(deck_data['y'], deck_data['sr'], deck_data['tempo'], 1)
-                        all_raw_segments.extend([(seg, deck_data['sr']) for seg in segments])
+                        y_to_process = deck_data['y']
+                        sr_to_process = deck_data['sr']
+                        
+                        if master_tempo and deck_data['tempo'] != master_tempo:
+                            # Time-stretch per sincronizzare il tempo
+                            stretch_factor = deck_data['tempo'] / master_tempo
+                            y_to_process = librosa.effects.time_stretch(y_to_process, rate=stretch_factor)
+                            
+                        segments = get_beat_segments(y_to_process, sr_to_process, deck_data['tempo'], 1)
+                        all_raw_segments.extend([(seg, sr_to_process) for seg in segments])
                 
                 if not all_raw_segments:
                     st.error("Impossibile creare il mix. Carica almeno un brano con un ritmo rilevabile.")
                 else:
                     first_deck_data = active_decks_data[0][1]
-                    if first_deck_data['tempo'] and first_deck_data['tempo'] > 0:
-                        duration_per_beat = 60 / first_deck_data['tempo']
+                    if master_tempo is None:
+                        # Se non c'è master, usiamo il tempo del primo deck come riferimento
+                        tempo_for_duration = first_deck_data['tempo']
+                    else:
+                        tempo_for_duration = master_tempo
+
+                    if tempo_for_duration and tempo_for_duration > 0:
+                        duration_per_beat = 60 / tempo_for_duration
                         num_segments_to_mix = int(desired_duration / duration_per_beat)
                         
                         if num_segments_to_mix > 0:
