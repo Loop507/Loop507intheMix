@@ -18,7 +18,6 @@ def analyze_track_for_slicing(audio_file_object):
     """
     audio_file_object.seek(0)
 
-    # Crea una copia temporanea del file caricato
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav_file:
         audio = AudioSegment.from_file(audio_file_object)
         audio.export(tmp_wav_file.name, format="wav")
@@ -27,10 +26,10 @@ def analyze_track_for_slicing(audio_file_object):
     try:
         y, sr = librosa.load(tmp_path, sr=None)
         
-        # Rileva i punti di attacco
         onset_frames = librosa.onset.onset_detect(y=y, sr=sr, units='frames')
         
-        # Stima il BPM per calcolare la durata di una battuta
+        # Stima un tempo per definire la griglia ritmica, ma non lo mostriamo
+        # L'importante è che la griglia sia coerente con il brano
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
         
         return y, sr, onset_frames, tempo
@@ -46,14 +45,11 @@ def create_loop(y, sr, tempo, num_beats):
     if tempo == 0:
         return y
 
-    # Calcola la durata di un beat in sample
     samples_per_beat = sr * 60 / tempo
     
-    # Inizia il loop dall'inizio del brano
     start_sample = 0
     end_sample = int(start_sample + samples_per_beat * num_beats)
     
-    # Se il loop supera la fine del brano, lo accorcia
     if end_sample > len(y):
         end_sample = len(y)
     
@@ -66,15 +62,16 @@ def randomize_track(y, sr, onset_frames, tempo):
     """
     Taglia il brano in segmenti e li ricompone in ordine casuale.
     """
+    if tempo == 0:
+        return y
+        
     frames_per_beat = sr * 60 / tempo
     
     segments = []
-    # Crea segmenti basati sui punti di attacco
     for i in range(len(onset_frames) - 1):
         start_frame = onset_frames[i]
         end_frame = onset_frames[i+1]
         
-        # Evita segmenti troppo corti
         if end_frame - start_frame >= frames_per_beat / 4:
             segments.append(y[start_frame:end_frame])
 
@@ -91,6 +88,9 @@ def randomize_two_decks(y1, sr1, onsets1, tempo1, y2, sr2, onsets2, tempo2):
     """
     Mescola segmenti di due brani in modo casuale.
     """
+    if tempo1 == 0 or tempo2 == 0:
+        return None, None
+        
     frames_per_beat1 = sr1 * 60 / tempo1
     frames_per_beat2 = sr2 * 60 / tempo2
     
@@ -114,10 +114,8 @@ def randomize_two_decks(y1, sr1, onsets1, tempo1, y2, sr2, onsets2, tempo2):
     all_segments = segments1 + segments2
     random.shuffle(all_segments)
     
-    # Assicura che i sample rate siano uguali prima di unire
     target_sr = sr1
     
-    # Resample i segmenti del secondo brano al sample rate del primo
     resampled_segments2 = [librosa.resample(y=seg, orig_sr=sr2, target_sr=target_sr) for seg in segments2]
     
     all_segments = segments1 + resampled_segments2
@@ -163,7 +161,7 @@ with col1:
             with st.spinner('Analizzo il brano...'):
                 y, sr, onsets, tempo = analyze_track_for_slicing(uploaded_file_a)
                 st.session_state.deck_a = {'file': uploaded_file_a, 'y': y, 'sr': sr, 'onsets': onsets, 'tempo': tempo}
-            st.success(f"Analisi completata! BPM stimato: {tempo:.2f}")
+            st.success("Analisi completata!")
 
 with col2:
     st.header("Deck B")
@@ -174,7 +172,7 @@ with col2:
             with st.spinner('Analizzo il brano...'):
                 y, sr, onsets, tempo = analyze_track_for_slicing(uploaded_file_b)
                 st.session_state.deck_b = {'file': uploaded_file_b, 'y': y, 'sr': sr, 'onsets': onsets, 'tempo': tempo}
-            st.success(f"Analisi completata! BPM stimato: {tempo:.2f}")
+            st.success("Analisi completata!")
 
 st.sidebar.header("Controlli Slicing e Ricomposizione")
 
