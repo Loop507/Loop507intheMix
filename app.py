@@ -6,6 +6,7 @@ from io import BytesIO
 
 # --- Funzioni di supporto per la chiave musicale ---
 
+# Mappatura Camelot per la visualizzazione
 CAMELOT_MAP = {
     'C': '8B', 'Am': '8A', 'G': '9B', 'Em': '9A',
     'D': '10B', 'Bm': '10A', 'A': '11B', 'F#m': '11A',
@@ -15,6 +16,7 @@ CAMELOT_MAP = {
     'Bb': '6B', 'Gm': '6A', 'F': '7B', 'Dm': '7A'
 }
 
+# Mappatura semitoni per il pitch shifting
 SEMITONES_MAP = {
     'C': 0, 'C#': 1, 'Db': 1, 'D': 2, 'D#': 3, 'Eb': 3, 'E': 4,
     'F': 5, 'F#': 6, 'Gb': 6, 'G': 7, 'G#': 8, 'Ab': 8, 'A': 9,
@@ -50,7 +52,11 @@ def estimate_key_simple(y, sr):
     """Stima la chiave musicale usando un metodo più robusto."""
     chroma = librosa.feature.chroma_stft(y=y, sr=sr)
     chroma_mean = np.mean(chroma, axis=1)
+    
+    # Rilevamento della chiave dominante
     key_idx = np.argmax(chroma_mean)
+    
+    # Mappatura da indice a nota
     key_notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
     return key_notes[key_idx]
 
@@ -58,6 +64,7 @@ def estimate_key_simple(y, sr):
 
 def analyze_track(audio_file_object):
     """Analizza un file audio per BPM e chiave musicale."""
+    audio_file_object.seek(0) # <--- Aggiunta questa riga
     y, sr = librosa.load(audio_file_object, sr=None)
     tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
     tempo_val = tempo.item()
@@ -66,6 +73,7 @@ def analyze_track(audio_file_object):
 
 def process_audio(audio_file_object, new_tempo, pitch_shift):
     """Modifica il tempo e l'intonazione del file audio."""
+    audio_file_object.seek(0) # <--- Aggiunta questa riga
     y, sr = librosa.load(audio_file_object, sr=None)
     tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
     if tempo == 0: tempo = 120.0
