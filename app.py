@@ -6,6 +6,7 @@ from io import BytesIO
 import tempfile
 import os
 import random
+import shutil
 
 # --- Funzioni di analisi e manipolazione audio ---
 
@@ -34,7 +35,7 @@ def analyze_track_for_slicing(audio_file_object):
         os.remove(tmp_path)
 
 
-def get_beat_segments(y, sr, onset_frames, tempo, num_beats_per_segment):
+def get_beat_segments(y, sr, tempo, num_beats_per_segment):
     """
     Divide il brano in segmenti di N battute e restituisce una lista di segmenti.
     """
@@ -90,47 +91,41 @@ def export_audio(y, sr):
 st.title("Loop507 in the Mix: Decomposizione e Ricomposizione")
 st.write("Carica un brano, decomponilo in segmenti e ricomponilo in un modo unico!")
 
-if 'deck_a' not in st.session_state:
-    st.session_state.deck_a = {'file': None, 'y': None, 'sr': None, 'onsets': None, 'tempo': None, 'segments': []}
+if 'deck' not in st.session_state:
+    st.session_state.deck = {'file': None, 'y': None, 'sr': None, 'onsets': None, 'tempo': None, 'segments': []}
 
-col1, = st.columns(1)
-
-with col1:
-    st.header("Deck")
-    uploaded_file_a = st.file_uploader("Carica Brano", type=["mp3", "wav"], key="uploader_a")
-    if uploaded_file_a:
-        st.audio(uploaded_file_a, format='audio/mp3')
-        if uploaded_file_a != st.session_state.deck_a['file']:
-            with st.spinner('Analizzo il brano...'):
-                y, sr, onsets, tempo = analyze_track_for_slicing(uploaded_file_a)
-                st.session_state.deck_a = {'file': uploaded_file_a, 'y': y, 'sr': sr, 'onsets': onsets, 'tempo': tempo, 'segments': []}
-            st.success("Analisi completata!")
+st.header("Deck")
+uploaded_file = st.file_uploader("Carica Brano", type=["mp3", "wav"])
+if uploaded_file:
+    st.audio(uploaded_file, format='audio/mp3')
+    if uploaded_file != st.session_state.deck['file']:
+        with st.spinner('Analizzo il brano...'):
+            y, sr, onsets, tempo = analyze_track_for_slicing(uploaded_file)
+            st.session_state.deck = {'file': uploaded_file, 'y': y, 'sr': sr, 'onsets': onsets, 'tempo': tempo, 'segments': []}
+        st.success("Analisi completata!")
 
 st.sidebar.header("Controlli Ricomposizione")
 
-if st.session_state.deck_a['file']:
+if st.session_state.deck['file']:
     num_beats_per_segment = st.sidebar.selectbox("Segmenti da (battute):", [1, 2, 4, 8])
     if st.sidebar.button("Decomponi Brano"):
-        st.session_state.deck_a['segments'] = get_beat_segments(
-            st.session_state.deck_a['y'],
-            st.session_state.deck_a['sr'],
-            st.session_state.deck_a['onsets'],
-            st.session_state.deck_a['tempo'],
+        st.session_state.deck['segments'] = get_beat_segments(
+            st.session_state.deck['y'],
+            st.session_state.deck['sr'],
+            st.session_state.deck['tempo'],
             num_beats_per_segment
         )
-        st.sidebar.success(f"Brano decomposto in {len(st.session_state.deck_a['segments'])} segmenti da {num_beats_per_segment} battute.")
+        st.sidebar.success(f"Brano decomposto in {len(st.session_state.deck['segments'])} segmenti da {num_beats_per_segment} battute.")
 
-    if st.session_state.deck_a['segments']:
+    if st.session_state.deck['segments']:
         st.sidebar.subheader("Ricomponi il Brano")
         
-        # Shuffle (riordina in modo casuale)
         if st.sidebar.button("Shuffle (Riordina)"):
-            random.shuffle(st.session_state.deck_a['segments'])
+            random.shuffle(st.session_state.deck['segments'])
             st.sidebar.success("Segmenti riordinati in modo casuale!")
             
-        # Creazione del nuovo brano
-        combined_audio = combine_segments(st.session_state.deck_a['segments'])
-        processed_audio_buffer = export_audio(combined_audio, st.session_state.deck_a['sr'])
+        combined_audio = combine_segments(st.session_state.deck['segments'])
+        processed_audio_buffer = export_audio(combined_audio, st.session_state.deck['sr'])
         
         if processed_audio_buffer:
             st.subheader("Brano Ricomposto")
