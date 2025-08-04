@@ -18,8 +18,56 @@ def get_camelot_key(key):
     }
     
     # Questo metodo funziona con chiavi come 'C', 'Am', 'G#m', ecc.
-    simple_key = key.replace('maj', '').replace('min', '').strip()
-    return camelot_map.get(simple_key, 'Unknown')
+    return camelot_map.get(key, 'Unknown')
+
+def estimate_key(y, sr):
+    """Stima la chiave musicale usando il croma."""
+    chroma = librosa.feature.chroma_stft(y=y, sr=sr)
+    # Calcola il profilo del croma medio
+    chroma_mean = np.mean(chroma, axis=1)
+
+    # Definisce i profili dei "modelli" per le chiavi maggiori e minori
+    major_profiles = {
+        'C': [1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1],
+        'C#': [1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0],
+        'D': [0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1],
+        'Eb': [1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0],
+        'E': [0, 1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1],
+        'F': [1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 1, 0],
+        'F#': [0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 1],
+        'G': [1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1],
+        'Ab': [1, 1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0],
+        'A': [0, 1, 1, 0, 1, 0, 1, 0, 1, 1, 0, 1],
+        'Bb': [1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 1, 0],
+        'B': [0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 1]
+    }
+    minor_profiles = {
+        'Am': [1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0],
+        'Bbm': [0, 1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1],
+        'Bm': [1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 1, 0],
+        'Cm': [0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 1],
+        'C#m': [1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1],
+        'Dm': [1, 1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0],
+        'D#m': [0, 1, 1, 0, 1, 0, 1, 0, 1, 1, 0, 1],
+        'Em': [1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 1, 0],
+        'Fm': [0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 1],
+        'F#m': [1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1],
+        'Gm': [1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0],
+        'G#m': [0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1]
+    }
+
+    # Calcola la correlazione tra il profilo del brano e i profili modello
+    best_match_key = 'Unknown'
+    best_score = 0
+    all_profiles = {**major_profiles, **minor_profiles}
+    for key, profile in all_profiles.items():
+        score = np.dot(chroma_mean, profile)
+        if score > best_score:
+            best_score = score
+            best_match_key = key
+    
+    return best_match_key
+
 
 def analyze_track(audio_file):
     """Analizza un file audio per BPM e chiave musicale."""
@@ -28,12 +76,10 @@ def analyze_track(audio_file):
     # Rilevamento BPM
     tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
 
-    # Rilevamento chiave
-    # Questo è il metodo più robusto e recente per stimare la chiave in librosa
-    pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
-    key_estimate = librosa.key_to_note(librosa.pitch_to_midi(pitches[np.argmax(magnitudes)]))
+    # Rilevamento chiave con il nostro algoritmo robusto
+    key = estimate_key(y, sr)
     
-    return tempo, key_estimate
+    return tempo, key
 
 def process_audio(audio_file, new_tempo, new_pitch):
     """Modifica il tempo e l'intonazione del file audio."""
