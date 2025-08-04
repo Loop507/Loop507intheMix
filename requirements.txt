@@ -3,3 +3,4 @@ librosa
 pydub
 numpy
 matplotlib
+ubio
