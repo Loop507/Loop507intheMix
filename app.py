@@ -75,7 +75,7 @@ def estimate_bpm_advanced(y, sr):
         # Metodo 2: Onset detection + autocorrelazione
         onset_frames = librosa.onset.onset_detect(y=y, sr=sr, hop_length=512)
         if len(onset_frames) > 1:
-            onset_times = librosa.onset.frames_to_time(onset_frames, sr=sr, hop_length=512)
+            onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=512)
             onset_intervals = np.diff(onset_times)
             
             if len(onset_intervals) > 0:
@@ -91,9 +91,12 @@ def estimate_bpm_advanced(y, sr):
         try:
             tempogram = librosa.feature.tempogram(y=y, sr=sr, hop_length=512)
             tempo_freqs = librosa.tempo_frequencies(len(tempogram))
-            tempo3_idx = np.argmax(np.mean(tempogram, axis=1))
-            tempo3 = tempo_freqs[tempo3_idx]
-        except:
+            if len(tempo_freqs) > 0:
+                tempo3_idx = np.argmax(np.mean(tempogram, axis=1))
+                tempo3 = tempo_freqs[tempo3_idx] if tempo3_idx < len(tempo_freqs) else tempo1
+            else:
+                tempo3 = tempo1
+        except Exception as e:
             tempo3 = tempo1
         
         # Normalizza i tempi (gestisci array)
