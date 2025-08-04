@@ -26,7 +26,9 @@ def analyze_track_for_slicing(audio_file_object):
         onset_frames = librosa.onset.onset_detect(y=y, sr=sr, units='frames')
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
         
-        return y, sr, onset_frames, tempo
+        duration = librosa.get_duration(y=y, sr=sr)
+        
+        return y, sr, onset_frames, tempo, duration
     finally:
         os.remove(tmp_path)
 
@@ -96,121 +98,47 @@ st.title("Loop507 in the Mix: Decomposizione e Ricomposizione")
 st.write("Carica i brani, decomponili in segmenti e ricomponili in un modo unico!")
 
 # Inizializza gli 8 deck
-if 'deck_a' not in st.session_state: st.session_state.deck_a = {'file': None, 'y': None, 'sr': None, 'onsets': None, 'tempo': None}
-if 'deck_b' not in st.session_state: st.session_state.deck_b = {'file': None, 'y': None, 'sr': None, 'onsets': None, 'tempo': None}
-if 'deck_c' not in st.session_state: st.session_state.deck_c = {'file': None, 'y': None, 'sr': None, 'onsets': None, 'tempo': None}
-if 'deck_d' not in st.session_state: st.session_state.deck_d = {'file': None, 'y': None, 'sr': None, 'onsets': None, 'tempo': None}
-if 'deck_e' not in st.session_state: st.session_state.deck_e = {'file': None, 'y': None, 'sr': None, 'onsets': None, 'tempo': None}
-if 'deck_f' not in st.session_state: st.session_state.deck_f = {'file': None, 'y': None, 'sr': None, 'onsets': None, 'tempo': None}
-if 'deck_g' not in st.session_state: st.session_state.deck_g = {'file': None, 'y': None, 'sr': None, 'onsets': None, 'tempo': None}
-if 'deck_h' not in st.session_state: st.session_state.deck_h = {'file': None, 'y': None, 'sr': None, 'onsets': None, 'tempo': None}
+deck_keys = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
+for key in deck_keys:
+    if f'deck_{key}' not in st.session_state:
+        st.session_state[f'deck_{key}'] = {'file': None, 'y': None, 'sr': None, 'onsets': None, 'tempo': None, 'duration': None}
+
 if 'decomposed_manual_segments' not in st.session_state:
     st.session_state.decomposed_manual_segments = []
 
-# Deck A-D
 col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.header("Deck A")
-    uploaded_file_a = st.file_uploader("Brano A", type=["mp3", "wav"], key="uploader_a")
-    if uploaded_file_a:
-        st.audio(uploaded_file_a, format='audio/mp3')
-        if uploaded_file_a != st.session_state.deck_a['file']:
-            with st.spinner('Analisi in corso...'):
-                y, sr, onsets, tempo = analyze_track_for_slicing(uploaded_file_a)
-                st.session_state.deck_a = {'file': uploaded_file_a, 'y': y, 'sr': sr, 'onsets': onsets, 'tempo': tempo}
-            st.success("Analisi completata!")
+cols_1_4 = [col1, col2, col3, col4]
+for i, key in enumerate(deck_keys[:4]):
+    with cols_1_4[i]:
+        st.header(f"Deck {key.upper()}")
+        uploaded_file = st.file_uploader(f"Brano {key.upper()}", type=["mp3", "wav"], key=f"uploader_{key}")
+        if uploaded_file:
+            st.audio(uploaded_file, format='audio/mp3')
+            if uploaded_file != st.session_state[f'deck_{key}']['file']:
+                with st.spinner('Analisi in corso...'):
+                    y, sr, onsets, tempo, duration = analyze_track_for_slicing(uploaded_file)
+                    st.session_state[f'deck_{key}'] = {'file': uploaded_file, 'y': y, 'sr': sr, 'onsets': onsets, 'tempo': tempo, 'duration': duration}
+                st.success(f"Analisi completata! Durata: {duration:.2f} secondi")
 
-with col2:
-    st.header("Deck B")
-    uploaded_file_b = st.file_uploader("Brano B", type=["mp3", "wav"], key="uploader_b")
-    if uploaded_file_b:
-        st.audio(uploaded_file_b, format='audio/mp3')
-        if uploaded_file_b != st.session_state.deck_b['file']:
-            with st.spinner('Analisi in corso...'):
-                y, sr, onsets, tempo = analyze_track_for_slicing(uploaded_file_b)
-                st.session_state.deck_b = {'file': uploaded_file_b, 'y': y, 'sr': sr, 'onsets': onsets, 'tempo': tempo}
-            st.success("Analisi completata!")
-            
-with col3:
-    st.header("Deck C")
-    uploaded_file_c = st.file_uploader("Brano C", type=["mp3", "wav"], key="uploader_c")
-    if uploaded_file_c:
-        st.audio(uploaded_file_c, format='audio/mp3')
-        if uploaded_file_c != st.session_state.deck_c['file']:
-            with st.spinner('Analisi in corso...'):
-                y, sr, onsets, tempo = analyze_track_for_slicing(uploaded_file_c)
-                st.session_state.deck_c = {'file': uploaded_file_c, 'y': y, 'sr': sr, 'onsets': onsets, 'tempo': tempo}
-            st.success("Analisi completata!")
-
-with col4:
-    st.header("Deck D")
-    uploaded_file_d = st.file_uploader("Brano D", type=["mp3", "wav"], key="uploader_d")
-    if uploaded_file_d:
-        st.audio(uploaded_file_d, format='audio/mp3')
-        if uploaded_file_d != st.session_state.deck_d['file']:
-            with st.spinner('Analisi in corso...'):
-                y, sr, onsets, tempo = analyze_track_for_slicing(uploaded_file_d)
-                st.session_state.deck_d = {'file': uploaded_file_d, 'y': y, 'sr': sr, 'onsets': onsets, 'tempo': tempo}
-            st.success("Analisi completata!")
-
-# Deck E-H
 col5, col6, col7, col8 = st.columns(4)
-with col5:
-    st.header("Deck E")
-    uploaded_file_e = st.file_uploader("Brano E", type=["mp3", "wav"], key="uploader_e")
-    if uploaded_file_e:
-        st.audio(uploaded_file_e, format='audio/mp3')
-        if uploaded_file_e != st.session_state.deck_e['file']:
-            with st.spinner('Analisi in corso...'):
-                y, sr, onsets, tempo = analyze_track_for_slicing(uploaded_file_e)
-                st.session_state.deck_e = {'file': uploaded_file_e, 'y': y, 'sr': sr, 'onsets': onsets, 'tempo': tempo}
-            st.success("Analisi completata!")
-
-with col6:
-    st.header("Deck F")
-    uploaded_file_f = st.file_uploader("Brano F", type=["mp3", "wav"], key="uploader_f")
-    if uploaded_file_f:
-        st.audio(uploaded_file_f, format='audio/mp3')
-        if uploaded_file_f != st.session_state.deck_f['file']:
-            with st.spinner('Analisi in corso...'):
-                y, sr, onsets, tempo = analyze_track_for_slicing(uploaded_file_f)
-                st.session_state.deck_f = {'file': uploaded_file_f, 'y': y, 'sr': sr, 'onsets': onsets, 'tempo': tempo}
-            st.success("Analisi completata!")
-            
-with col7:
-    st.header("Deck G")
-    uploaded_file_g = st.file_uploader("Brano G", type=["mp3", "wav"], key="uploader_g")
-    if uploaded_file_g:
-        st.audio(uploaded_file_g, format='audio/mp3')
-        if uploaded_file_g != st.session_state.deck_g['file']:
-            with st.spinner('Analisi in corso...'):
-                y, sr, onsets, tempo = analyze_track_for_slicing(uploaded_file_g)
-                st.session_state.deck_g = {'file': uploaded_file_g, 'y': y, 'sr': sr, 'onsets': onsets, 'tempo': tempo}
-            st.success("Analisi completata!")
-
-with col8:
-    st.header("Deck H")
-    uploaded_file_h = st.file_uploader("Brano H", type=["mp3", "wav"], key="uploader_h")
-    if uploaded_file_h:
-        st.audio(uploaded_file_h, format='audio/mp3')
-        if uploaded_file_h != st.session_state.deck_h['file']:
-            with st.spinner('Analisi in corso...'):
-                y, sr, onsets, tempo = analyze_track_for_slicing(uploaded_file_h)
-                st.session_state.deck_h = {'file': uploaded_file_h, 'y': y, 'sr': sr, 'onsets': onsets, 'tempo': tempo}
-            st.success("Analisi completata!")
+cols_5_8 = [col5, col6, col7, col8]
+for i, key in enumerate(deck_keys[4:]):
+    with cols_5_8[i]:
+        st.header(f"Deck {key.upper()}")
+        uploaded_file = st.file_uploader(f"Brano {key.upper()}", type=["mp3", "wav"], key=f"uploader_{key}")
+        if uploaded_file:
+            st.audio(uploaded_file, format='audio/mp3')
+            if uploaded_file != st.session_state[f'deck_{key}']['file']:
+                with st.spinner('Analisi in corso...'):
+                    y, sr, onsets, tempo, duration = analyze_track_for_slicing(uploaded_file)
+                    st.session_state[f'deck_{key}'] = {'file': uploaded_file, 'y': y, 'sr': sr, 'onsets': onsets, 'tempo': tempo, 'duration': duration}
+                st.success(f"Analisi completata! Durata: {duration:.2f} secondi")
 
 st.sidebar.header("Controlli Ricomposizione")
 
-active_decks_data = []
-if st.session_state.deck_a['file']: active_decks_data.append(('A', st.session_state.deck_a))
-if st.session_state.deck_b['file']: active_decks_data.append(('B', st.session_state.deck_b))
-if st.session_state.deck_c['file']: active_decks_data.append(('C', st.session_state.deck_c))
-if st.session_state.deck_d['file']: active_decks_data.append(('D', st.session_state.deck_d))
-if st.session_state.deck_e['file']: active_decks_data.append(('E', st.session_state.deck_e))
-if st.session_state.deck_f['file']: active_decks_data.append(('F', st.session_state.deck_f))
-if st.session_state.deck_g['file']: active_decks_data.append(('G', st.session_state.deck_g))
-if st.session_state.deck_h['file']: active_decks_data.append(('H', st.session_state.deck_h))
-
+active_decks_data = [
+    (key.upper(), st.session_state[f'deck_{key}']) for key in deck_keys if st.session_state[f'deck_{key}']['file']
+]
 
 if active_decks_data:
     st.sidebar.subheader("Decomponi i Brani")
@@ -234,25 +162,21 @@ if active_decks_data:
 
     if recomposition_mode == "Mix Manuale":
         if st.session_state.decomposed_manual_segments:
-            st.sidebar.subheader("Selezione Segmenti")
-            selected_segment_indices = st.sidebar.multiselect(
-                "Scegli i segmenti per il tuo mix",
-                options=[f"{seg['source']} - Segmento {seg['index'] + 1}" for seg in st.session_state.decomposed_manual_segments]
+            st.sidebar.subheader("Seleziona e Ricomponi")
+            selected_decks = st.sidebar.multiselect(
+                "Scegli i brani da includere nel mix manuale",
+                options=[deck[0] for deck in active_decks_data]
             )
-
+            
             if st.sidebar.button("Crea Mix Manuale"):
                 with st.spinner('Creazione del brano ricomposto...'):
                     selected_segments_list = []
-                    for sel_index in selected_segment_indices:
-                        parts = sel_index.split(' - Segmento ')
-                        source = parts[0]
-                        index = int(parts[1]) - 1
-                        
-                        for seg_info in st.session_state.decomposed_manual_segments:
-                            if seg_info['source'] == source and seg_info['index'] == index:
-                                selected_segments_list.append((seg_info['segment'], seg_info['sr']))
-                                break
-                    
+                    for deck_name in selected_decks:
+                        segments_from_deck = [
+                            (seg['segment'], seg['sr']) for seg in st.session_state.decomposed_manual_segments if seg['source'] == deck_name
+                        ]
+                        selected_segments_list.extend(segments_from_deck)
+
                     if selected_segments_list:
                         combined_audio, target_sr = combine_segments(selected_segments_list)
                         processed_audio_buffer = export_audio(combined_audio, target_sr)
@@ -260,33 +184,52 @@ if active_decks_data:
                         if processed_audio_buffer:
                             st.subheader("Mix Manuale")
                             st.audio(processed_audio_buffer, format="audio/mp3")
+                            duration_mix = librosa.get_duration(y=combined_audio, sr=target_sr)
+                            st.success(f"Mix creato con successo! Durata: {duration_mix:.2f} secondi")
                             st.download_button("Scarica Mix Manuale", data=processed_audio_buffer, file_name="mix_manuale.mp3", mime="audio/mp3")
                         else:
                             st.error("Impossibile creare il mix selezionato.")
                     else:
-                        st.error("Nessun segmento selezionato.")
+                        st.error("Nessun brano selezionato per il mix manuale.")
         else:
             st.sidebar.warning("Devi decomporre i brani prima di usare questa opzione.")
     
     if recomposition_mode == "Mix Casuale Completo":
+        st.sidebar.subheader("Controllo Durata del Mix")
+        st.sidebar.write("La durata standard suggerita per un mix è di 60 secondi.")
+        desired_duration = st.sidebar.number_input("Durata desiderata del mix (in secondi)", min_value=1.0, value=60.0, step=1.0)
+        
         if st.sidebar.button("Crea Mix Casuale Completo"):
             with st.spinner('Creazione del brano ricomposto...'):
                 all_raw_segments = []
                 for deck_name, deck_data in active_decks_data:
                     if deck_data['y'] is not None and deck_data['tempo'] is not None and deck_data['tempo'] > 0:
-                        all_raw_segments.extend([(seg, deck_data['sr']) for seg in get_beat_segments(deck_data['y'], deck_data['sr'], deck_data['tempo'], 1)])
+                        segments = get_beat_segments(deck_data['y'], deck_data['sr'], deck_data['tempo'], 1)
+                        all_raw_segments.extend([(seg, deck_data['sr']) for seg in segments])
                 
                 if not all_raw_segments:
                     st.error("Impossibile creare il mix. Carica almeno un brano con un ritmo rilevabile.")
                 else:
-                    random.shuffle(all_raw_segments)
-                    
-                    combined_audio, target_sr = combine_segments(all_raw_segments)
-                    processed_audio_buffer = export_audio(combined_audio, target_sr)
+                    first_deck_data = active_decks_data[0][1]
+                    if first_deck_data['tempo'] and first_deck_data['tempo'] > 0:
+                        duration_per_beat = 60 / first_deck_data['tempo']
+                        num_segments_to_mix = int(desired_duration / duration_per_beat)
+                        
+                        if num_segments_to_mix > 0:
+                            random_mix_segments = random.sample(all_raw_segments, min(num_segments_to_mix, len(all_raw_segments)))
+                            
+                            combined_audio, target_sr = combine_segments(random_mix_segments)
+                            processed_audio_buffer = export_audio(combined_audio, target_sr)
 
-                    if processed_audio_buffer:
-                        st.subheader("Mix Casuale Completo")
-                        st.audio(processed_audio_buffer, format="audio/mp3")
-                        st.download_button("Scarica Mix Casuale", data=processed_audio_buffer, file_name="mix_casuale.mp3", mime="audio/mp3")
+                            if processed_audio_buffer:
+                                st.subheader("Mix Casuale Completo")
+                                st.audio(processed_audio_buffer, format="audio/mp3")
+                                duration_mix = librosa.get_duration(y=combined_audio, sr=target_sr)
+                                st.success(f"Mix creato con successo! Durata: {duration_mix:.2f} secondi")
+                                st.download_button("Scarica Mix Casuale", data=processed_audio_buffer, file_name="mix_casuale.mp3", mime="audio/mp3")
+                            else:
+                                st.error("Impossibile creare il mix.")
+                        else:
+                            st.error("La durata desiderata è troppo breve per creare un mix significativo.")
                     else:
-                        st.error("Impossibile creare il mix.")
+                        st.error("Impossibile calcolare la durata dei segmenti. Assicurati di caricare almeno un brano valido.")
