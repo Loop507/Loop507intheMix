@@ -9,182 +9,173 @@ import random
 import shutil
 
 # --- Configurazione FFmpeg per il server ---
-# Questo blocco aiuta Pydub a trovare FFmpeg su Streamlit Cloud
+# Essenziale per far funzionare Pydub su Streamlit Cloud
 ffmpeg_bin = shutil.which("ffmpeg")
 if ffmpeg_bin:
     AudioSegment.converter = ffmpeg_bin
 else:
-    st.error("ATTENZIONE: FFmpeg non trovato. Assicurati di avere 'ffmpeg' nel file packages.txt")
+    st.error("ATTENZIONE: FFmpeg non trovato. Verifica il file packages.txt")
 
 # --- Funzioni di analisi e manipolazione audio ---
 
 @st.cache_data
 def analyze_track_for_slicing(audio_file_object):
-    """
-    Analizza un brano e restituisce l'audio e i dati necessari per lo slicing.
-    """
+    """Analizza il brano e calcola BPM e durata."""
     audio_file_object.seek(0)
     
-    # Usiamo un file temporaneo per permettere a librosa di leggere il file
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav_file:
         try:
-            # Convertiamo l'input in un formato che librosa capisce sicuramente
+            # Convertiamo in WAV temporaneo per Librosa
             audio = AudioSegment.from_file(audio_file_object)
             audio.export(tmp_wav_file.name, format="wav")
             tmp_path = tmp_wav_file.name
 
             y, sr = librosa.load(tmp_path, sr=None)
-            onset_frames = librosa.onset.onset_detect(y=y, sr=sr, units='frames')
             tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
             
-            # Gestione caso in cui il tempo non venga rilevato (array o float)
+            # Normalizzazione del valore tempo (BPM)
             if isinstance(tempo, np.ndarray):
-                tempo = tempo[0] if len(tempo) > 0 else 0
+                tempo = float(tempo[0]) if len(tempo) > 0 else 0.0
+            else:
+                tempo = float(tempo)
             
             duration = librosa.get_duration(y=y, sr=sr)
-            return y, sr, onset_frames, tempo, duration
+            return y, sr, tempo, duration
         except Exception as e:
-            st.error(f"Errore durante l'analisi: {e}")
-            return None, None, None, 0, 0
+            st.error(f"Errore analisi: {e}")
+            return None, None, 0.0, 0.0
         finally:
             if os.path.exists(tmp_wav_file.name):
                 os.remove(tmp_path)
 
 def get_beat_segments(y, sr, tempo, num_beats_per_segment):
-    """Divide il brano in segmenti basati sulle battute."""
+    """Divide l'audio in segmenti basati sul tempo musicale."""
     if tempo <= 0:
         return []
 
+    # Calcola quanti campioni audio ci sono in N battute
     samples_per_beat = sr * 60 / tempo
+    segment_length = int(samples_per_beat * num_beats_per_segment)
+    
     segments = []
-    current_sample = 0
-    while current_sample < len(y):
-        end_sample = int(current_sample + samples_per_beat * num_beats_per_segment)
-        if end_sample > len(y):
-            end_sample = len(y)
-        
-        segment = y[current_sample:end_sample]
-        if len(segment) > 0:
-            segments.append(segment)
-        current_sample = end_sample
+    for i in range(0, len(y), segment_length):
+        seg = y[i : i + segment_length]
+        if len(seg) > 0:
+            segments.append(seg)
     return segments
 
-def combine_segments(segments):
-    """Unisce i segmenti garantendo che abbiano lo stesso sample rate."""
-    if not segments:
+def combine_segments(segments_list):
+    """Unisce i segmenti audio in un unico array."""
+    if not segments_list:
         return np.array([]), None
     
-    target_sr = segments[0][1]
-    resampled_segments = []
-    for seg, sr_orig in segments:
+    target_sr = segments_list[0][1]
+    final_audio = []
+    
+    for seg, sr_orig in segments_list:
         if sr_orig != target_sr:
-            resampled_segments.append(librosa.resample(y=seg, orig_sr=sr_orig, target_sr=target_sr))
-        else:
-            resampled_segments.append(seg)
+            # Resampling se i brani hanno sample rate diversi
+            seg = librosa.resample(y=seg, orig_sr=sr_orig, target_sr=target_sr)
+        final_audio.append(seg)
 
-    combined_audio = np.concatenate(resampled_segments)
-    return combined_audio, target_sr
+    return np.concatenate(final_audio), target_sr
 
 def export_audio(y, sr):
-    """Esporta l'audio in un buffer MP3 pronto per il download o l'ascolto."""
-    if len(y) == 0 or sr is None:
-        return None
+    """Trasforma l'array NumPy in un file MP3 scaricabile."""
+    if len(y) == 0: return None
+    
+    # Normalizzazione per evitare distorsioni (clipping)
+    max_val = np.max(np.abs(y))
+    if max_val > 0:
+        y_norm = (y / max_val) * 32767
+    else:
+        y_norm = y
         
     buffer = BytesIO()
-    # Normalizzazione e conversione in 16-bit PCM
-    y_norm = np.int16(y / np.max(np.abs(y)) * 32767) if np.max(np.abs(y)) > 0 else y.astype(np.int16)
-    
-    audio_segment = AudioSegment(
-        y_norm.tobytes(),
+    audio_seg = AudioSegment(
+        y_norm.astype(np.int16).tobytes(),
         frame_rate=sr,
         sample_width=2,
         channels=1
     )
-    audio_segment.export(buffer, format="mp3")
+    audio_seg.export(buffer, format="mp3")
     buffer.seek(0)
     return buffer
 
-# --- Interfaccia utente con Streamlit ---
-st.set_page_config(page_title="Loop507 Mix", layout="wide")
-st.title("Loop507 in the Mix: Decomposizione e Ricomposizione")
+# --- Interfaccia Utente ---
+st.set_page_config(page_title="Loop507 Mixer", layout="wide")
+st.title("🎧 Loop507 in the Mix")
+st.markdown("Carica i tuoi brani nei Deck e crea un mix unico basato sui BPM.")
 
-# Inizializzazione Deck
+# Inizializzazione Stato
 deck_keys = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
-for key in deck_keys:
-    if f'deck_{key}' not in st.session_state:
-        st.session_state[f'deck_{key}'] = {'file_name': None, 'y': None, 'sr': None, 'tempo': None}
+if 'decks' not in st.session_state:
+    st.session_state.decks = {k: {'name': None, 'y': None, 'sr': None, 'tempo': 0} for k in deck_keys}
+if 'segments' not in st.session_state:
+    st.session_state.segments = []
 
-if 'decomposed_manual_segments' not in st.session_state:
-    st.session_state.decomposed_manual_segments = []
-
-# Layout a Griglia per i Deck
-for row in [deck_keys[:4], deck_keys[4:]]:
+# Griglia dei Deck (4x2)
+for row_keys in [deck_keys[:4], deck_keys[4:]]:
     cols = st.columns(4)
-    for i, key in enumerate(row):
+    for i, k in enumerate(row_keys):
         with cols[i]:
-            st.subheader(f"Deck {key.upper()}")
-            uploaded_file = st.file_uploader(f"Carica {key.upper()}", type=["mp3", "wav"], key=f"up_{key}")
-            if uploaded_file:
-                # Carichiamo l'analisi solo se il file è cambiato
-                if st.session_state[f'deck_{key}']['file_name'] != uploaded_file.name:
-                    with st.spinner('Analisi...'):
-                        y, sr, onsets, tempo, duration = analyze_track_for_slicing(uploaded_file)
-                        if y is not None:
-                            st.session_state[f'deck_{key}'] = {
-                                'file_name': uploaded_file.name, 
-                                'y': y, 'sr': sr, 'tempo': tempo
-                            }
-                            st.success(f"{tempo:.0f} BPM rilevati")
-                st.audio(uploaded_file)
+            st.subheader(f"Deck {k.upper()}")
+            up = st.file_uploader(f"Audio {k.upper()}", type=["mp3", "wav"], key=f"file_{k}")
+            if up:
+                if st.session_state.decks[k]['name'] != up.name:
+                    with st.spinner("Analizzando..."):
+                        y, sr, bpm, dur = analyze_track_for_slicing(up)
+                        st.session_state.decks[k] = {'name': up.name, 'y': y, 'sr': sr, 'tempo': bpm}
+                st.write(f"⏱️ {bpm:.1f} BPM")
+                st.audio(up)
 
-# --- Controlli Ricomposizione ---
-st.sidebar.header("🎛️ Mixer Control")
-active_decks = [(k.upper(), st.session_state[f'deck_{k}']) for k in deck_keys if st.session_state[f'deck_{k}']['y'] is not None]
+# Sidebar Comandi
+st.sidebar.header("🎛️ Pannello di Controllo")
+active_decks = {k: v for k, v in st.session_state.decks.items() if v['y'] is not None}
 
 if active_decks:
-    num_beats = st.sidebar.selectbox("Battute per segmento:", [1, 2, 4, 8], index=2)
+    beats = st.sidebar.selectbox("Lunghezza segmenti (battute):", [1, 2, 4, 8], index=2)
     
-    if st.sidebar.button("🔨 Decomponi Brani"):
-        st.session_state.decomposed_manual_segments = []
-        for name, data in active_decks:
-            segs = get_beat_segments(data['y'], data['sr'], data['tempo'], num_beats)
-            for i, s in enumerate(segs):
-                st.session_state.decomposed_manual_segments.append({'source': name, 'segment': s, 'sr': data['sr']})
-        st.sidebar.toast(f"Creati {len(st.session_state.decomposed_manual_segments)} segmenti!")
+    if st.sidebar.button("🔨 Decomponi Audio"):
+        st.session_state.segments = []
+        for k, data in active_decks.items():
+            s_list = get_beat_segments(data['y'], data['sr'], data['tempo'], beats)
+            for s in s_list:
+                st.session_state.segments.append({'deck': k, 'audio': s, 'sr': data['sr']})
+        # CORREZIONE: st.toast chiamato direttamente, non su sidebar
+        st.toast(f"Creati {len(st.session_state.segments)} segmenti musicali!")
 
-    mode = st.sidebar.radio("Modalità Mix:", ["Casuale", "Manuale"])
+    mode = st.sidebar.radio("Modalità Mix:", ["Casuale", "Selettiva"])
 
-    if mode == "Casuale" and st.session_state.decomposed_manual_segments:
-        dur = st.sidebar.slider("Durata Mix (secondi)", 10, 120, 30)
-        if st.sidebar.button("Genera Mix Magico"):
-            with st.spinner("Miscelando..."):
-                # Calcolo approssimativo segmenti necessari
-                first_sr = st.session_state.decomposed_manual_segments[0]['sr']
-                total_samples_needed = dur * first_sr
-                current_samples = 0
-                chosen = []
-                
-                while current_samples < total_samples_needed:
-                    s = random.choice(st.session_state.decomposed_manual_segments)
-                    chosen.append((s['segment'], s['sr']))
-                    current_samples += len(s['segment'])
-                
-                combined, final_sr = combine_segments(chosen)
-                out = export_audio(combined, final_sr)
-                if out:
-                    st.divider()
-                    st.subheader("✨ Il tuo nuovo Mix Casuale")
-                    st.audio(out, format="audio/mp3")
-                    st.download_button("Scarica Mix", out, "mix_loop507.mp3")
+    if st.session_state.segments:
+        if mode == "Casuale":
+            sec = st.sidebar.number_input("Secondi di mix:", 10, 300, 60)
+            if st.sidebar.button("Genera Mix Casuale"):
+                with st.spinner("Creazione in corso..."):
+                    chosen = []
+                    current_len = 0
+                    target_samples = sec * st.session_state.segments[0]['sr']
+                    
+                    while current_len < target_samples:
+                        pick = random.choice(st.session_state.segments)
+                        chosen.append((pick['audio'], pick['sr']))
+                        current_len += len(pick['audio'])
+                    
+                    mix, final_sr = combine_segments(chosen)
+                    out = export_audio(mix, final_sr)
+                    st.subheader("🔥 Il tuo Mix Casuale")
+                    st.audio(out)
+                    st.download_button("Download Mix", out, "mix_casuale.mp3")
 
-    elif mode == "Manuale" and active_decks:
-        selected = st.sidebar.multiselect("Quali deck includere?", [d[0] for d in active_decks])
-        if st.sidebar.button("Crea Mix Manuale") and selected:
-            # Prende i segmenti solo dai deck selezionati
-            manual_chosen = [(s['segment'], s['sr']) for s in st.session_state.decomposed_manual_segments if s['source'] in selected]
-            if manual_chosen:
-                combined, final_sr = combine_segments(manual_chosen)
-                out = export_audio(combined, final_sr)
-                st.audio(out)
+        else: # Selettiva
+            to_include = st.sidebar.multiselect("Scegli i Deck da mixare:", [k.upper() for k in active_decks.keys()])
+            if st.sidebar.button("Crea Mix Selettivo") and to_include:
+                chosen = [(s['audio'], s['sr']) for s in st.session_state.segments if s['deck'].upper() in to_include]
+                if chosen:
+                    mix, final_sr = combine_segments(chosen)
+                    out = export_audio(mix, final_sr)
+                    st.subheader("🎼 Mix Manuale")
+                    st.audio(out)
+                    st.download_button("Download Mix", out, "mix_manuale.mp3")
 else:
-    st.info("Carica almeno un brano per iniziare a mixare!")
+    st.sidebar.info("Carica dei brani per attivare il mixer.")
