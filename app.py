@@ -8,167 +8,157 @@ import os
 import random
 import shutil
 
-# --- Configurazione FFmpeg per il server ---
+# --- Configurazione FFmpeg ---
 ffmpeg_bin = shutil.which("ffmpeg")
 if ffmpeg_bin:
     AudioSegment.converter = ffmpeg_bin
 else:
-    st.error("ATTENZIONE: FFmpeg non trovato. Verifica il file packages.txt")
+    st.error("ATTENZIONE: FFmpeg non trovato. Verifica l'installazione sul sistema.")
 
-# --- Funzioni di analisi e manipolazione audio ---
+# --- Funzioni di Analisi e Taglio ---
 
 @st.cache_data
-def analyze_track_for_slicing(audio_file_object):
-    """Analizza il brano e calcola BPM e durata."""
+def analyze_track(audio_file_object):
+    """Analizza il brano per estrarre waveform, Sample Rate e BPM."""
     audio_file_object.seek(0)
-    
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav_file:
-        try:
-            audio = AudioSegment.from_file(audio_file_object)
-            audio.export(tmp_wav_file.name, format="wav")
-            tmp_path = tmp_wav_file.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        audio = AudioSegment.from_file(audio_file_object)
+        audio.export(tmp.name, format="wav")
+        y, sr = librosa.load(tmp.name, sr=None)
+        # Calcolo BPM
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        tempo_val = float(tempo[0]) if isinstance(tempo, np.ndarray) else float(tempo)
+        return y, sr, tempo_val
 
-            y, sr = librosa.load(tmp_path, sr=None)
-            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-            
-            # Normalizzazione BPM
-            if isinstance(tempo, np.ndarray):
-                tempo_val = float(tempo[0]) if len(tempo) > 0 else 0.0
-            else:
-                tempo_val = float(tempo)
-            
-            duration = librosa.get_duration(y=y, sr=sr)
-            return y, sr, tempo_val, duration
-        except Exception as e:
-            st.error(f"Errore analisi: {e}")
-            return None, None, 0.0, 0.0
-        finally:
-            if os.path.exists(tmp_wav_file.name):
-                os.remove(tmp_wav_file.name)
-
-def get_beat_segments(y, sr, tempo, num_beats_per_segment):
-    """Divide l'audio in segmenti basati sul tempo musicale."""
-    if tempo <= 0:
-        return []
+def get_beat_segments(y, sr, tempo, num_beats):
+    """Taglia l'audio seguendo il tempo musicale (BPM)."""
+    if tempo <= 0: return []
     samples_per_beat = sr * 60 / tempo
-    segment_length = int(samples_per_beat * num_beats_per_segment)
-    
+    segment_length = int(samples_per_beat * num_beats)
+    return [y[i : i + segment_length] for i in range(0, len(y), segment_length) if (i + segment_length) <= len(y)]
+
+def get_random_segments(y, sr, min_dur, max_dur):
+    """Taglia l'audio in pezzi casuali (Frenesia/Glitch)."""
     segments = []
-    for i in range(0, len(y), segment_length):
-        seg = y[i : i + segment_length]
-        if len(seg) > 0:
-            segments.append(seg)
+    curr = 0
+    while curr < len(y):
+        dur = random.uniform(min_dur, max_dur)
+        length = int(dur * sr)
+        if curr + length > len(y): break
+        segments.append(y[curr : curr + length])
+        curr += length
     return segments
 
-def combine_segments(segments_list):
-    """Unisce i segmenti audio in un unico array."""
-    if not segments_list:
-        return np.array([]), None
-    target_sr = segments_list[0][1]
-    final_audio = []
-    for seg, sr_orig in segments_list:
-        if sr_orig != target_sr:
-            seg = librosa.resample(y=seg, orig_sr=sr_orig, target_sr=target_sr)
-        final_audio.append(seg)
-    return np.concatenate(final_audio), target_sr
-
 def export_audio(y, sr):
-    """Trasforma l'array NumPy in un file MP3."""
+    """Esporta l'array numpy in un buffer MP3 pronto per il download."""
     if len(y) == 0: return None
+    # Normalizzazione per evitare distorsioni
     max_val = np.max(np.abs(y))
-    y_norm = (y / max_val) * 32767 if max_val > 0 else y
+    y_norm = (y / max_val * 32767).astype(np.int16) if max_val > 0 else y.astype(np.int16)
     buffer = BytesIO()
-    audio_seg = AudioSegment(
-        y_norm.astype(np.int16).tobytes(),
-        frame_rate=sr,
-        sample_width=2,
-        channels=1
-    )
+    audio_seg = AudioSegment(y_norm.tobytes(), frame_rate=sr, sample_width=2, channels=1)
     audio_seg.export(buffer, format="mp3")
     buffer.seek(0)
     return buffer
 
-# --- Interfaccia Utente ---
-st.set_page_config(page_title="Loop507 Mixer", layout="wide")
-st.title("🎧 Loop507 in the Mix")
+# --- Interfaccia Utente Streamlit ---
+st.set_page_config(page_title="Loop507 Hyper-Mixer", layout="wide")
+st.title("🎧 Loop507: Audio Shuffler & Glitcher")
 
-# Inizializzazione Stato
-deck_keys = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
+# Stato dell'applicazione
 if 'decks' not in st.session_state:
-    st.session_state.decks = {k: {'name': None, 'y': None, 'sr': None, 'tempo': 0.0} for k in deck_keys}
+    st.session_state.decks = {k: {'y': None, 'sr': None, 'tempo': 0.0, 'name': None} for k in 'abcdefgh'}
 if 'segments' not in st.session_state:
     st.session_state.segments = []
 
-# Griglia dei Deck (4x2)
-for row_keys in [deck_keys[:4], deck_keys[4:]]:
+# Griglia dei Deck (Caricamento Audio)
+deck_keys = list(st.session_state.decks.keys())
+for row_idx in [0, 4]:
     cols = st.columns(4)
-    for i, k in enumerate(row_keys):
+    for i, k in enumerate(deck_keys[row_idx : row_idx + 4]):
         with cols[i]:
-            st.subheader(f"Deck {k.upper()}")
-            up = st.file_uploader(f"Audio {k.upper()}", type=["mp3", "wav"], key=f"file_{k}")
+            st.markdown(f"### Deck {k.upper()}")
+            up = st.file_uploader(f"Carica {k.upper()}", type=["mp3", "wav"], key=f"up_{k}", label_visibility="collapsed")
             
             if up:
-                # Se il file è nuovo, lo analizziamo
                 if st.session_state.decks[k]['name'] != up.name:
-                    with st.spinner("Analizzando..."):
-                        y, sr, t_val, dur = analyze_track_for_slicing(up)
-                        st.session_state.decks[k] = {'name': up.name, 'y': y, 'sr': sr, 'tempo': t_val}
+                    with st.spinner(f"Analizzando {k.upper()}..."):
+                        y, sr, t = analyze_track(up)
+                        st.session_state.decks[k] = {'y': y, 'sr': sr, 'tempo': t, 'name': up.name}
                 
-                # Visualizziamo i dati recuperandoli dalla session_state (così non danno NameError)
-                current_bpm = st.session_state.decks[k]['tempo']
-                st.write(f"⏱️ {current_bpm:.1f} BPM")
-                st.audio(up)
+                if st.session_state.decks[k]['y'] is not None:
+                    st.success(f"{up.name}")
+                    st.write(f"⏱️ **{st.session_state.decks[k]['tempo']:.1f} BPM**")
+                    st.audio(up)
 
-# Sidebar Comandi
+# Sidebar: Pannello di Controllo Doppia Modalità
 st.sidebar.header("🎛️ Pannello di Controllo")
 active_decks = {k: v for k, v in st.session_state.decks.items() if v['y'] is not None}
 
 if active_decks:
-    beats = st.sidebar.selectbox("Battute per segmento:", [1, 2, 4, 8], index=2)
-    
-    if st.sidebar.button("🔨 Decomponi Audio"):
-        st.session_state.segments = []
-        for k, data in active_decks.items():
-            s_list = get_beat_segments(data['y'], data['sr'], data['tempo'], beats)
-            for s in s_list:
-                st.session_state.segments.append({'deck': k, 'audio': s, 'sr': data['sr']})
-        st.toast(f"Creati {len(st.session_state.segments)} segmenti!")
+    st.sidebar.subheader("1. Scegli Stile di Taglio")
+    tipo_taglio = st.sidebar.radio(
+        "Modalità:", 
+        ["Ritmo Musicale (BPM)", "Frenesia Casuale (Secondi)"],
+        help="BPM per remix coerenti, Secondi per effetti glitch estremi."
+    )
 
-    mode = st.sidebar.radio("Modalità Mix:", ["Casuale", "Selettiva"])
+    if tipo_taglio == "Ritmo Musicale (BPM)":
+        beats = st.sidebar.selectbox("Battute per segmento:", [0.5, 1, 2, 4, 8], index=2)
+        if st.sidebar.button("🔨 Decomponi a Tempo"):
+            st.session_state.segments = []
+            for k, d in active_decks.items():
+                segs = get_beat_segments(d['y'], d['sr'], d['tempo'], beats)
+                for s in segs: st.session_state.segments.append({'audio': s, 'sr': d['sr'], 'deck': k})
+            st.sidebar.success(f"Creati {len(st.session_state.segments)} pezzi musicali!")
 
+    else: # Frenesia Casuale (Secondi)
+        st.sidebar.info("Imposta un range opposto al video per creare contrasto!")
+        range_sec = st.sidebar.slider(
+            "Range durata (sec):", 
+            0.05, 2.0, (0.8, 1.2), 
+            step=0.05,
+            help="Tagli brevi (0.1-0.3) = Caos. Tagli lunghi (0.8-1.5) = Stabilità."
+        )
+        if st.sidebar.button("🌪️ Frulla Audio (Glitch)"):
+            st.session_state.segments = []
+            for k, d in active_decks.items():
+                segs = get_random_segments(d['y'], d['sr'], range_sec[0], range_sec[1])
+                for s in segs: st.session_state.segments.append({'audio': s, 'sr': d['sr'], 'deck': k})
+            st.sidebar.warning(f"Creati {len(st.session_state.segments)} micro-pezzi!")
+
+    # Sezione Generazione Mix
     if st.session_state.segments:
-        if mode == "Casuale":
-            sec = st.sidebar.number_input("Secondi di mix:", 10, 300, 30)
-            if st.sidebar.button("Genera Mix Casuale"):
-                with st.spinner("Mixing..."):
-                    chosen = []
-                    curr_len = 0
-                    # Usiamo il sample rate del primo segmento come riferimento
-                    ref_sr = st.session_state.segments[0]['sr']
-                    target_samples = sec * ref_sr
-                    
-                    while curr_len < target_samples:
-                        pick = random.choice(st.session_state.segments)
-                        chosen.append((pick['audio'], pick['sr']))
-                        curr_len += len(pick['audio'])
-                    
-                    mix, final_sr = combine_segments(chosen)
-                    out = export_audio(mix, final_sr)
-                    if out:
-                        st.divider()
-                        st.audio(out)
-                        st.download_button("Scarica Mix", out, "mix_casuale.mp3")
-
-        else: # Selettiva
-            opts = [k.upper() for k in active_decks.keys()]
-            to_include = st.sidebar.multiselect("Includi Deck:", opts)
-            if st.sidebar.button("Crea Mix Selettivo") and to_include:
-                chosen = [(s['audio'], s['sr']) for s in st.session_state.segments if s['deck'].upper() in to_include]
-                if chosen:
-                    mix, final_sr = combine_segments(chosen)
-                    out = export_audio(mix, final_sr)
-                    st.divider()
-                    st.audio(out)
-                    st.download_button("Scarica Mix Manuale", out, "mix_manuale.mp3")
+        st.sidebar.divider()
+        st.sidebar.subheader("2. Esportazione")
+        durata_mix = st.sidebar.number_input("Durata Mix Finale (sec):", 10, 600, 60)
+        
+        if st.sidebar.button("🚀 GENERA MIX FINALE"):
+            with st.spinner("Rimescolando il mazzo..."):
+                # Mescoliamo i segmenti per casualità totale
+                all_segs = list(st.session_state.segments)
+                random.shuffle(all_segs)
+                
+                chosen = []
+                curr_samples = 0
+                ref_sr = all_segs[0]['sr']
+                target_samples = durata_mix * ref_sr
+                
+                while curr_samples < target_samples:
+                    pick = random.choice(all_segs)
+                    chosen.append(pick['audio'])
+                    curr_samples += len(pick['audio'])
+                
+                final_y = np.concatenate(chosen)
+                out = export_audio(final_y, ref_sr)
+                
+                st.divider()
+                st.subheader("🎵 Risultato del Mix")
+                st.audio(out)
+                st.download_button("📥 Scarica Mix MP3", out, "loop507_custom_mix.mp3")
 else:
-    st.sidebar.info("Carica brani nei Deck per iniziare.")
+    st.sidebar.info("Carica almeno un brano nei Deck per sbloccare i comandi.")
+
+# Footer
+st.markdown("---")
+st.caption("Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva")
