@@ -116,6 +116,22 @@ def export_audio(y, sr):
     return buffer
 
 
+def time_stretch_stereo(y, rate):
+    """Cambia davvero la velocità dell'audio (non solo la lunghezza dei tagli), preservando
+    l'intonazione (phase vocoder via librosa.effects.time_stretch). rate > 1 = più veloce,
+    rate < 1 = più lento. Applicato canale per canale per non mescolare L/R."""
+    if rate is None or rate <= 0 or abs(rate - 1.0) < 1e-3:
+        return y  # nulla da fare, o rate non valido: restituisco l'audio invariato
+    stretched_channels = []
+    for ch in range(y.shape[0]):
+        stretched_channels.append(librosa.effects.time_stretch(y[ch], rate=rate))
+    # Il phase vocoder puo' produrre canali di lunghezza leggermente diversa per arrotondamenti:
+    # uniformo al più corto per poter poi fare np.stack senza errori di shape.
+    min_len = min(ch.shape[0] for ch in stretched_channels)
+    stretched_channels = [ch[:min_len] for ch in stretched_channels]
+    return np.stack(stretched_channels, axis=0)
+
+
 def invalidate_mix():
     """Invalida il mix precedente quando i segmenti cambiano (fix bug #4)."""
     st.session_state.pop("mix_ready", None)
@@ -197,15 +213,35 @@ if active_decks:
 
     if tipo_taglio == "Ritmo Musicale (BPM)":
         beats = st.sidebar.selectbox("Battute per segmento:", [0.5, 1, 2, 4, 8], index=2)
+        apply_stretch = st.sidebar.checkbox(
+            "🎚️ Correggi davvero il tempo (time-stretch)",
+            value=False,
+            help="Se il BPM manuale è diverso da quello rilevato, l'audio viene realmente "
+                 "accelerato/rallentato (intonazione preservata) invece di limitarsi a cambiare "
+                 "la lunghezza dei tagli. Più lento da calcolare e introduce lievi artefatti."
+        )
         if st.sidebar.button("🔨 Decomponi a Tempo"):
             st.session_state.segments = []
+            stretched_decks = 0
             for k, d in active_decks.items():
-                segs = get_beat_segments(d['y'], d['sr'], d['tempo'], beats)
+                y_for_cut = d['y']
+                # Applico il time-stretch solo se: l'utente lo ha attivato, esiste un BPM
+                # rilevato affidabile come riferimento, e il BPM manuale è effettivamente diverso.
+                if apply_stretch and d['tempo_detected'] > 1.0 and d['tempo'] > 0 \
+                        and abs(d['tempo'] - d['tempo_detected']) > 0.5:
+                    rate = d['tempo'] / d['tempo_detected']
+                    with st.spinner(f"Time-stretch Deck {k.upper()} (rate {rate:.3f}x)..."):
+                        y_for_cut = time_stretch_stereo(d['y'], rate)
+                    stretched_decks += 1
+                segs = get_beat_segments(y_for_cut, d['sr'], d['tempo'], beats)
                 for s in segs:
                     st.session_state.segments.append({'audio': s, 'sr': d['sr'], 'deck': k})
             invalidate_mix()
             if st.session_state.segments:
-                st.sidebar.success(f"Creati {len(st.session_state.segments)} pezzi musicali!")
+                msg = f"Creati {len(st.session_state.segments)} pezzi musicali!"
+                if stretched_decks:
+                    msg += f" (tempo corretto realmente su {stretched_decks} deck)"
+                st.sidebar.success(msg)
             else:
                 st.sidebar.info(
                     "Nessun segmento creato con il BPM impostato: aumenta il valore di 'Battute per segmento' "
@@ -280,7 +316,7 @@ if active_decks:
                     ts_audio = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     st.session_state.audio_report = f"""
 ╔════════════════════════════════════════════════════════════════╗
-  HYPER-MIXER v3.2 - AUDIO RECONSTRUCTION LOG (STEREO)
+  HYPER-MIXER v3.3 - AUDIO RECONSTRUCTION LOG (STEREO + TIME-STRETCH)
   Generated on: {ts_audio}
 ╚════════════════════════════════════════════════════════════════╝
 
@@ -288,7 +324,7 @@ if active_decks:
 
 ═══════════════════ ITALIANO ═══════════════════
 
-:: ENGINE: hyper_mixer_loop507 [v3.2]
+:: ENGINE: hyper_mixer_loop507 [v3.3]
 :: ANALISI: Beat Tracking (Librosa) / RMS Envelope
 :: STILE: Audio-Glitch / Granular Synthesis
 :: PROCESSO: Shuffling Ricorsivo / Cross-Deck Fragmentation / Sample Rate Uniformato / Stereo Preservato
@@ -304,7 +340,7 @@ if active_decks:
 
 ═══════════════════ ENGLISH ═══════════════════
 
-:: ENGINE: hyper_mixer_loop507 [v3.2]
+:: ENGINE: hyper_mixer_loop507 [v3.3]
 :: ANALYSIS: Beat Tracking (Librosa) / RMS Envelope
 :: STYLE: Audio-Glitch / Granular Synthesis
 :: PROCESS: Recursive Shuffling / Cross-Deck Fragmentation / Uniform Sample Rate / Stereo Preserved
@@ -336,4 +372,4 @@ if st.session_state.get('mix_ready'):
         st.download_button("📄 Scarica Report Audio", st.session_state.audio_report, "audio_report.txt", use_container_width=True)
 
 st.markdown("---")
-st.caption("Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva | Stereo v3.2")
+st.caption("Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva | Stereo + Time-Stretch v3.3")
