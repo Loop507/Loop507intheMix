@@ -131,6 +131,16 @@ if 'decks' not in st.session_state:
         k: {'y': None, 'sr': None, 'tempo': 0.0, 'tempo_detected': 0.0, 'name': None}
         for k in 'abcdefgh'
     }
+else:
+    # Migrazione difensiva: se una sessione già aperta prima di questo aggiornamento
+    # ha un dict deck "vecchio" senza 'tempo_detected' (o altri campi futuri),
+    # lo completiamo qui invece di andare in KeyError.
+    for _k, _d in st.session_state.decks.items():
+        _d.setdefault('tempo_detected', _d.get('tempo', 0.0))
+        _d.setdefault('tempo', 0.0)
+        _d.setdefault('y', None)
+        _d.setdefault('sr', None)
+        _d.setdefault('name', None)
 if 'segments' not in st.session_state:
     st.session_state.segments = []
 if 'audio_report' not in st.session_state:
@@ -161,7 +171,7 @@ for row_idx in [0, 4]:
                             del st.session_state[bpm_key]
                 if st.session_state.decks[k]['y'] is not None:
                     st.success(f"{up.name}")
-                    detected = st.session_state.decks[k]['tempo_detected']
+                    detected = st.session_state.decks[k].get('tempo_detected', 0.0)
                     if detected <= 1.0:
                         # Beat non marcato (es. classica, ambient, brani senza percussione):
                         # non e' un errore, semplicemente Librosa non trova un battito regolare.
