@@ -7,6 +7,7 @@ import tempfile
 import os
 import random
 import shutil
+import json
 from datetime import datetime
 
 # --- Configurazione FFmpeg ---
@@ -72,8 +73,10 @@ def get_beat_segments(y, sr, tempo, num_beats):
     segment_length = max(MIN_SEGMENT_SAMPLES, min(segment_length, max_samples))
 
     total_samples = y.shape[1]
+    # .copy() e' essenziale: senza, ogni segmento sarebbe solo una "vista" sulla memoria
+    # dell'array originale, quindi anche liberando d['y'] la RAM non verrebbe mai rilasciata.
     return [
-        y[:, i:i + segment_length]
+        y[:, i:i + segment_length].copy()
         for i in range(0, total_samples, segment_length)
         if (i + segment_length) <= total_samples
     ]
@@ -93,7 +96,7 @@ def get_random_segments(y, sr, min_dur, max_dur):
             break
         if curr + length > total_samples:
             break
-        segments.append(y[:, curr:curr + length])
+        segments.append(y[:, curr:curr + length].copy())
         curr += length
     return segments
 
@@ -132,9 +135,38 @@ def time_stretch_stereo(y, rate):
     return np.stack(stretched_channels, axis=0)
 
 
+def concat_with_crossfade(segments, crossfade_samples):
+    """Concatena i segmenti con un breve dissolvenza incrociata (overlap-add) tra ognuno,
+    per evitare i click/pop tipici della concatenazione a taglio netto. Se crossfade_samples
+    e' 0 o c'e' un solo segmento, equivale a una concatenazione normale."""
+    if crossfade_samples <= 0 or len(segments) <= 1:
+        return np.concatenate(segments, axis=1)
+
+    result = segments[0].copy()
+    for seg in segments[1:]:
+        fade = min(crossfade_samples, result.shape[1], seg.shape[1])
+        if fade <= 0:
+            result = np.concatenate([result, seg], axis=1)
+            continue
+        fade_out = np.linspace(1.0, 0.0, fade)
+        fade_in = np.linspace(0.0, 1.0, fade)
+        overlap = result[:, -fade:] * fade_out + seg[:, :fade] * fade_in
+        result = np.concatenate([result[:, :-fade], overlap, seg[:, fade:]], axis=1)
+    return result
+
+
+def estimate_memory_mb(y):
+    """Stima approssimativa della RAM occupata da un array audio (utile per avvisare
+    l'utente prima che Streamlit Cloud vada in affanno con troppi deck lunghi)."""
+    if y is None:
+        return 0.0
+    return y.nbytes / (1024 * 1024)
+
+
 def invalidate_mix():
     """Invalida il mix precedente quando i segmenti cambiano (fix bug #4)."""
     st.session_state.pop("mix_ready", None)
+    st.session_state.pop("mix_preset", None)
     st.session_state.audio_report = ""
 
 
@@ -187,6 +219,8 @@ for row_idx in [0, 4]:
                             del st.session_state[bpm_key]
                 if st.session_state.decks[k]['y'] is not None:
                     st.success(f"{up.name}")
+                    mem_mb = estimate_memory_mb(st.session_state.decks[k]['y'])
+                    st.caption(f"💾 ~{mem_mb:.1f} MB in RAM")
                     detected = st.session_state.decks[k].get('tempo_detected', 0.0)
                     if detected <= 1.0:
                         # Beat non marcato (es. classica, ambient, brani senza percussione):
@@ -203,6 +237,20 @@ for row_idx in [0, 4]:
                     )
                     st.session_state.decks[k]['tempo'] = manual_bpm
                     st.audio(up)
+                    if st.session_state.segments:
+                        # Ha senso liberare la RAM solo dopo aver già estratto i segmenti:
+                        # da questo momento i segmenti sono copie indipendenti (fix .copy()),
+                        # quindi l'audio originale del deck non serve più finché non vuoi
+                        # ri-tagliarlo con parametri diversi.
+                        if st.button(f"🧹 Libera RAM Deck {k.upper()}", key=f"free_{k}"):
+                            st.session_state.decks[k]['y'] = None
+                            st.rerun()
+                elif st.session_state.decks[k]['name'] == up.name:
+                    # Il deck e' stato "liberato" volontariamente: i segmenti già estratti
+                    # restano validi e utilizzabili nel mix, ma per ri-tagliare questo deck
+                    # con parametri diversi serve ricaricare il file.
+                    st.success(f"{up.name}")
+                    st.caption("💾 RAM liberata — i segmenti già estratti restano disponibili per il mix.")
 
 st.sidebar.header("🎛️ Pannello di Controllo")
 active_decks = {k: v for k, v in st.session_state.decks.items() if v['y'] is not None}
@@ -264,12 +312,39 @@ if active_decks:
     if st.session_state.segments:
         st.sidebar.divider()
         st.sidebar.subheader("2. Esportazione")
+
+        # Pesi per deck: un deck con pochi segmenti (es. un loop corto) non deve sparire
+        # nel mix solo perché un altro deck ne ha prodotti molti di più.
+        contributing_decks = sorted({s['deck'] for s in st.session_state.segments})
+        deck_weights = {}
+        with st.sidebar.expander("⚖️ Peso dei deck nel mix"):
+            st.caption("Peso più alto = quel deck viene pescato più spesso, a prescindere da quanti segmenti ha prodotto.")
+            for dk in contributing_decks:
+                deck_weights[dk] = st.slider(f"Deck {dk.upper()}", 1, 10, 5, key=f"weight_{dk}")
+
+        apply_crossfade = st.sidebar.checkbox(
+            "🎛️ Crossfade tra i tagli",
+            value=False,
+            help="Breve dissolvenza incrociata tra un segmento e il successivo, per evitare "
+                 "click/pop secchi. Disattivalo se vuoi l'effetto glitch più tagliente e crudo."
+        )
+        crossfade_ms = st.sidebar.slider("Durata crossfade (ms)", 1, 100, 15, disabled=not apply_crossfade) if apply_crossfade else 0
+
+        seed_input = st.sidebar.number_input(
+            "🎲 Seed (0 = casuale ogni volta)", min_value=0, value=0, step=1,
+            help="Imposta un numero per rendere il mix riproducibile. Il seed usato viene "
+                 "salvato nel preset scaricabile, così puoi ritrovare un mix riuscito per caso."
+        )
+
         durata_mix = st.sidebar.number_input("Durata Mix Finale (sec):", 10, 600, 60)
 
         if st.sidebar.button("🚀 GENERA MIX FINALE"):
             with st.spinner("Rimescolando il mazzo..."):
+                seed_used = seed_input if seed_input > 0 else random.randint(1, 2**31 - 1)
+                rng = random.Random(seed_used)  # RNG locale e seedato: rende il mix riproducibile
+
                 all_segs = list(st.session_state.segments)
-                random.shuffle(all_segs)
+                rng.shuffle(all_segs)
 
                 # Tutti i deck sono già a TARGET_SR grazie al fix in analyze_track,
                 # ma manteniamo un controllo esplicito e un fallback difensivo (fix bug #1).
@@ -290,13 +365,24 @@ if active_decks:
                 curr_samples = 0
                 target_samples = durata_mix * ref_sr
 
+                # Peso effettivo per segmento: peso_deck diviso per quanti segmenti quel deck
+                # ha prodotto, cosi' il peso impostato dall'utente vale per il deck nel suo
+                # complesso e non viene "diluito" se il deck ha tanti segmenti piccoli.
+                deck_counts = {}
+                for s in all_segs:
+                    deck_counts[s['deck']] = deck_counts.get(s['deck'], 0) + 1
+                weights_list = [
+                    deck_weights.get(s['deck'], 5) / max(1, deck_counts.get(s['deck'], 1))
+                    for s in all_segs
+                ]
+
                 # Guardia anti-loop-infinito (fix bug #2): esce comunque dopo un numero
                 # ragionevole di tentativi anche se, per qualche motivo, i segmenti
                 # scelti non facessero avanzare il conteggio.
                 max_attempts = max(1000, len(all_segs) * 50)
                 attempts = 0
                 while curr_samples < target_samples and attempts < max_attempts:
-                    pick = random.choice(all_segs)
+                    pick = rng.choices(all_segs, weights=weights_list, k=1)[0]
                     # shape[1] = lunghezza temporale del segmento stereo (2, n): NON usare len(),
                     # che su un array (2, n) restituirebbe 2 (il numero di canali) invece della durata.
                     seg_len = pick['audio'].shape[1]
@@ -308,15 +394,40 @@ if active_decks:
                 if not chosen:
                     st.sidebar.error("Impossibile generare il mix: nessun segmento valido disponibile.")
                 else:
-                    # Concatenazione lungo l'asse temporale (axis=1), non lungo i canali.
-                    final_y = np.concatenate(chosen, axis=1)
+                    # Concatenazione lungo l'asse temporale, con crossfade opzionale per
+                    # evitare i click secchi tra un segmento e il successivo.
+                    crossfade_samples = int(ref_sr * crossfade_ms / 1000) if apply_crossfade else 0
+                    final_y = concat_with_crossfade(chosen, crossfade_samples)
                     out = export_audio(final_y, ref_sr)
+
+                    # --- PRESET RIPRODUCIBILE (seed + parametri) ---
+                    taglio_dettaglio = beats if tipo_taglio == "Ritmo Musicale (BPM)" else list(range_sec)
+                    preset = {
+                        "loop507_hyper_mixer_preset": True,
+                        "versione_app": "4.0",
+                        "seed": seed_used,
+                        "modalita_taglio": tipo_taglio,
+                        "parametro_taglio": taglio_dettaglio,
+                        "crossfade_ms": crossfade_ms if apply_crossfade else 0,
+                        "pesi_deck": deck_weights,
+                        "durata_mix_sec": durata_mix,
+                        "deck": [
+                            {"deck": k, "file": d['name'], "bpm_usato": d['tempo']}
+                            for k, d in active_decks.items()
+                        ],
+                        "nota": (
+                            "Per riprovare a riottenere questo stesso mix: ricarica gli stessi file "
+                            "negli stessi deck, imposta la stessa modalità/parametro di taglio e gli "
+                            "stessi pesi, poi inserisci questo seed prima di generare."
+                        )
+                    }
+                    st.session_state.mix_preset = json.dumps(preset, ensure_ascii=False, indent=2)
 
                     # --- GENERAZIONE REPORT BRANDIZZATO BILINGUE ---
                     ts_audio = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     st.session_state.audio_report = f"""
 ╔════════════════════════════════════════════════════════════════╗
-  HYPER-MIXER v3.3 - AUDIO RECONSTRUCTION LOG (STEREO + TIME-STRETCH)
+  HYPER-MIXER v4.0 - AUDIO RECONSTRUCTION LOG (STEREO + TIME-STRETCH + CROSSFADE)
   Generated on: {ts_audio}
 ╚════════════════════════════════════════════════════════════════╝
 
@@ -324,10 +435,10 @@ if active_decks:
 
 ═══════════════════ ITALIANO ═══════════════════
 
-:: ENGINE: hyper_mixer_loop507 [v3.3]
+:: ENGINE: hyper_mixer_loop507 [v4.0]
 :: ANALISI: Beat Tracking (Librosa) / RMS Envelope
 :: STILE: Audio-Glitch / Granular Synthesis
-:: PROCESSO: Shuffling Ricorsivo / Cross-Deck Fragmentation / Sample Rate Uniformato / Stereo Preservato
+:: PROCESSO: Shuffling Ricorsivo (seed {seed_used}) / Cross-Deck Fragmentation / Sample Rate Uniformato / Stereo Preservato / Pesi Deck Personalizzati
 
 "Audio-Data fragment: Il ritmo è solo una variabile manipolata dal caos."
 
@@ -336,14 +447,16 @@ if active_decks:
 * Pool Segmenti: {len(st.session_state.segments)} campioni estratti
 * Modalità: {tipo_taglio}
 * Campionamento: {ref_sr} Hz / Stereo (L/R preservati, mono duplicato se sorgente mono)
+* Crossfade: {f"{crossfade_ms}ms" if apply_crossfade else "disattivato"}
+* Seed: {seed_used}
 * Durata Output: {durata_mix}s
 
 ═══════════════════ ENGLISH ═══════════════════
 
-:: ENGINE: hyper_mixer_loop507 [v3.3]
+:: ENGINE: hyper_mixer_loop507 [v4.0]
 :: ANALYSIS: Beat Tracking (Librosa) / RMS Envelope
 :: STYLE: Audio-Glitch / Granular Synthesis
-:: PROCESS: Recursive Shuffling / Cross-Deck Fragmentation / Uniform Sample Rate / Stereo Preserved
+:: PROCESS: Recursive Shuffling (seed {seed_used}) / Cross-Deck Fragmentation / Uniform Sample Rate / Stereo Preserved / Custom Deck Weights
 
 "Audio-Data fragment: Rhythm is just a variable manipulated by chaos."
 
@@ -352,6 +465,8 @@ if active_decks:
 * Segments Pool: {len(st.session_state.segments)} extracted samples
 * Mode: {tipo_taglio}
 * Sampling: {ref_sr} Hz / Stereo (L/R preserved, mono duplicated if source was mono)
+* Crossfade: {f"{crossfade_ms}ms" if apply_crossfade else "disabled"}
+* Seed: {seed_used}
 * Output Duration: {durata_mix}s
 
 > Regia e Algoritmo / Direction & Algorithm: Loop507
@@ -365,11 +480,17 @@ if st.session_state.get('mix_ready'):
     st.divider()
     st.subheader("🎵 Risultato del Mix")
     st.audio(st.session_state.mix_ready)
-    col_d1, col_d2 = st.columns(2)
+    col_d1, col_d2, col_d3 = st.columns(3)
     with col_d1:
         st.download_button("📥 Scarica Mix MP3", st.session_state.mix_ready, "loop507_custom_mix.mp3", use_container_width=True)
     with col_d2:
         st.download_button("📄 Scarica Report Audio", st.session_state.audio_report, "audio_report.txt", use_container_width=True)
+    with col_d3:
+        st.download_button(
+            "🎲 Scarica Preset (seed)", st.session_state.get('mix_preset', '{}'),
+            "loop507_preset.json", use_container_width=True,
+            help="Contiene il seed e i parametri usati: ricaricalo per riprovare a ritrovare questo mix."
+        )
 
 st.markdown("---")
-st.caption("Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva | Stereo + Time-Stretch v3.3")
+st.caption("Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva | Stereo + Time-Stretch + Crossfade v4.0")
