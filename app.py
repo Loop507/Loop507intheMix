@@ -101,6 +101,63 @@ def get_random_segments(y, sr, min_dur, max_dur):
     return segments
 
 
+def get_onset_segments(y, sr):
+    """Taglia ai transienti reali dell'audio (attacchi di nota, percussioni, cambi bruschi
+    di energia) invece che su un grid rigido o su durate casuali. Stesso principio del
+    backtrack sugli onset già usato in R13, qui applicato alla detection mono e poi
+    proiettato sul taglio stereo. y ha shape (2, n)."""
+    total_samples = y.shape[1]
+    if total_samples < MIN_SEGMENT_SAMPLES * 2:
+        return []
+
+    y_mono = np.mean(y, axis=0)
+    onset_samples = librosa.onset.onset_detect(y=y_mono, sr=sr, backtrack=True, units="samples")
+
+    # Servono almeno due punti (inizio e fine) per formare un segmento; se la detection
+    # non trova transienti utili (es. drone, rumore bianco costante), niente di grave:
+    # semplicemente questa modalità non produce nulla per questo deck.
+    points = sorted(set([0, *onset_samples.tolist(), total_samples]))
+    if len(points) < 2:
+        return []
+
+    max_samples = int(MAX_SEGMENT_SECONDS * sr)
+    segments = []
+    for start, end in zip(points[:-1], points[1:]):
+        end = min(end, start + max_samples)  # clamp di sicurezza anche qui (fix bug #5)
+        length = end - start
+        if length < MIN_SEGMENT_SAMPLES:
+            continue
+        segments.append(y[:, start:end].copy())
+    return segments
+
+
+def get_leader_cut_lengths(y_leader, sr, leader_mode, tempo=None, num_beats=None):
+    """Ricava dal deck 'leader' solo le LUNGHEZZE dei tagli (non l'audio), da imporre
+    poi a tutti gli altri deck: e' la 'struttura' che i follower devono rispettare."""
+    if leader_mode == "onset":
+        segs = get_onset_segments(y_leader, sr)
+    else:  # "bpm"
+        segs = get_beat_segments(y_leader, sr, tempo, num_beats)
+    return [s.shape[1] for s in segs]
+
+
+def apply_cut_lengths(y, lengths):
+    """Applica in sequenza una lista di lunghezze (derivata dal leader) a un deck qualsiasi,
+    scorrendo il suo audio dall'inizio. Se il deck 'follower' finisce prima di esaurire
+    tutte le lunghezze richieste, si ferma semplicemente li' — nessun loop forzato."""
+    segments = []
+    curr = 0
+    total_samples = y.shape[1]
+    for length in lengths:
+        if length <= 0:
+            continue
+        if curr + length > total_samples:
+            break
+        segments.append(y[:, curr:curr + length].copy())
+        curr += length
+    return segments
+
+
 def export_audio(y, sr):
     """Esporta un array stereo (2, n) in MP3 stereo, con interleaving corretto dei canali."""
     if y.shape[1] == 0:
@@ -257,10 +314,23 @@ active_decks = {k: v for k, v in st.session_state.decks.items() if v['y'] is not
 
 if active_decks:
     st.sidebar.subheader("1. Scegli Stile di Taglio")
-    tipo_taglio = st.sidebar.radio("Modalità:", ["Ritmo Musicale (BPM)", "Frenesia Casuale (Secondi)"])
+    tipo_taglio = st.sidebar.radio(
+        "Modalità:",
+        [
+            "Ritmo Musicale (BPM)",
+            "Frenesia Casuale (Secondi)",
+            "🎯 Slice per Transienti (Onset)",
+            "👑 Deck Leader / Followers",
+        ]
+    )
+
+    taglio_meta = {}  # metadati del taglio corrente, valorizzati nel ramo attivo qui sotto;
+                      # evita di dover ri-derivare i parametri più avanti (rischio NameError
+                      # ora che le modalità sono 4 e non più solo BPM/Casuale)
 
     if tipo_taglio == "Ritmo Musicale (BPM)":
         beats = st.sidebar.selectbox("Battute per segmento:", [0.5, 1, 2, 4, 8], index=2)
+        taglio_meta = {"modalita": "bpm", "beats": beats}
         apply_stretch = st.sidebar.checkbox(
             "🎚️ Correggi davvero il tempo (time-stretch)",
             value=False,
@@ -295,8 +365,9 @@ if active_decks:
                     "Nessun segmento creato con il BPM impostato: aumenta il valore di 'Battute per segmento' "
                     "oppure prova la modalità 'Frenesia Casuale' — utile per brani senza ritmo marcato (classica, ambient)."
                 )
-    else:
+    elif tipo_taglio == "Frenesia Casuale (Secondi)":
         range_sec = st.sidebar.slider("Range durata (sec):", 0.05, 2.0, (0.8, 1.2), step=0.05)
+        taglio_meta = {"modalita": "casuale", "range_sec": list(range_sec)}
         if st.sidebar.button("🌪️ Frulla Audio (Glitch)"):
             st.session_state.segments = []
             for k, d in active_decks.items():
@@ -308,6 +379,101 @@ if active_decks:
                 st.sidebar.warning(f"Creati {len(st.session_state.segments)} micro-pezzi!")
             else:
                 st.sidebar.info("Nessun segmento creato: prova un range di durata più ampio o più corto.")
+
+    elif tipo_taglio == "🎯 Slice per Transienti (Onset)":
+        taglio_meta = {"modalita": "onset"}
+        st.sidebar.caption(
+            "Taglia ogni deck nei suoi punti di attacco reali (percussioni, note, cambi di energia) "
+            "invece che su un grid fisso o su durate casuali. Ogni deck produce segmenti di lunghezza "
+            "naturale e diversa, dettata dal contenuto stesso."
+        )
+        if st.sidebar.button("⚡ Slice ai Transienti"):
+            st.session_state.segments = []
+            decks_senza_transienti = []
+            for k, d in active_decks.items():
+                with st.spinner(f"Rilevo transienti Deck {k.upper()}..."):
+                    segs = get_onset_segments(d['y'], d['sr'])
+                if not segs:
+                    decks_senza_transienti.append(k.upper())
+                for s in segs:
+                    st.session_state.segments.append({'audio': s, 'sr': d['sr'], 'deck': k})
+            invalidate_mix()
+            if st.session_state.segments:
+                st.sidebar.success(f"Creati {len(st.session_state.segments)} frammenti dai transienti!")
+                if decks_senza_transienti:
+                    st.sidebar.info(
+                        f"Deck {', '.join(decks_senza_transienti)}: nessun transiente chiaro trovato "
+                        "(es. drone, rumore costante) — nessun segmento da lì, non è un errore."
+                    )
+            else:
+                st.sidebar.info(
+                    "Nessun transiente rilevato su nessun deck: prova 'Ritmo Musicale' o "
+                    "'Frenesia Casuale' per questo materiale."
+                )
+
+    else:  # "👑 Deck Leader / Followers"
+        st.sidebar.caption(
+            "Un deck 'conduttore' impone la propria griglia di tagli a tutti gli altri: ogni "
+            "follower viene tagliato con le STESSE lunghezze del leader, applicate al proprio "
+            "audio in sequenza dall'inizio. Un follower più corto del leader si ferma prima, "
+            "senza loop forzati — è la sua materia che finisce, non un errore."
+        )
+        leader_key = st.sidebar.selectbox(
+            "Deck Leader (conduttore):",
+            options=list(active_decks.keys()),
+            format_func=lambda k: f"Deck {k.upper()}"
+        )
+        leader_submode = st.sidebar.radio(
+            "Il leader detta i tagli tramite:",
+            ["BPM", "Transienti (Onset)"],
+            horizontal=True
+        )
+        leader_beats = None
+        if leader_submode == "BPM":
+            leader_beats = st.sidebar.selectbox("Battute per segmento (leader):", [0.5, 1, 2, 4, 8], index=2)
+
+        taglio_meta = {
+            "modalita": "leader_followers",
+            "leader": leader_key,
+            "leader_submode": leader_submode,
+            "leader_beats": leader_beats,
+        }
+
+        if st.sidebar.button("👑 Applica Struttura del Leader"):
+            leader_d = active_decks[leader_key]
+            leader_mode = "bpm" if leader_submode == "BPM" else "onset"
+            with st.spinner(f"Calcolo la struttura dal Deck {leader_key.upper()}..."):
+                lengths = get_leader_cut_lengths(
+                    leader_d['y'], leader_d['sr'], leader_mode,
+                    tempo=leader_d['tempo'], num_beats=leader_beats
+                )
+            if not lengths:
+                st.sidebar.info(
+                    f"Il Deck {leader_key.upper()} non produce una struttura utilizzabile con questo metodo "
+                    "(BPM non impostato o nessun transiente rilevato). Prova l'altro sotto-metodo."
+                )
+            else:
+                st.session_state.segments = []
+                follower_vuoti = []
+                for k, d in active_decks.items():
+                    segs = apply_cut_lengths(d['y'], lengths)
+                    if not segs:
+                        follower_vuoti.append(k.upper())
+                    for s in segs:
+                        st.session_state.segments.append({'audio': s, 'sr': d['sr'], 'deck': k})
+                invalidate_mix()
+                if st.session_state.segments:
+                    st.sidebar.success(
+                        f"Struttura del Deck {leader_key.upper()} ({len(lengths)} tagli) imposta a "
+                        f"{len(active_decks)} deck — {len(st.session_state.segments)} segmenti totali."
+                    )
+                    if follower_vuoti:
+                        st.sidebar.info(
+                            f"Deck {', '.join(follower_vuoti)}: troppo corti per seguire questa struttura, "
+                            "nessun segmento prodotto da lì."
+                        )
+                else:
+                    st.sidebar.error("Nessun deck è riuscito a seguire questa struttura: prova un leader diverso.")
 
     if st.session_state.segments:
         st.sidebar.divider()
@@ -401,7 +567,7 @@ if active_decks:
                     out = export_audio(final_y, ref_sr)
 
                     # --- PRESET RIPRODUCIBILE (seed + parametri) ---
-                    taglio_dettaglio = beats if tipo_taglio == "Ritmo Musicale (BPM)" else list(range_sec)
+                    taglio_dettaglio = taglio_meta
                     preset = {
                         "loop507_hyper_mixer_preset": True,
                         "versione_app": "4.0",
