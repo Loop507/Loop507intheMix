@@ -101,11 +101,37 @@ def get_random_segments(y, sr, min_dur, max_dur):
     return segments
 
 
-def get_onset_segments(y, sr):
+def get_beat_segments_range(y, sr, tempo, min_beats, max_beats):
+    """Come get_beat_segments, ma invece di un numero fisso di battute per taglio, ogni
+    segmento usa una lunghezza casuale (in battute) pescata nel range [min_beats, max_beats].
+    Utile per non avere sempre tagli tutti identici anche in modalità 'a ritmo'."""
+    if tempo is None or tempo <= 1e-3:
+        return []
+    samples_per_beat = sr * 60 / tempo
+    max_samples = int(MAX_SEGMENT_SECONDS * sr)
+    total_samples = y.shape[1]
+    lo, hi = (min_beats, max_beats) if min_beats <= max_beats else (max_beats, min_beats)
+
+    segments = []
+    curr = 0
+    while curr < total_samples:
+        beats = random.uniform(lo, hi)
+        length = int(samples_per_beat * beats)
+        length = max(MIN_SEGMENT_SAMPLES, min(length, max_samples))
+        if curr + length > total_samples:
+            break
+        segments.append(y[:, curr:curr + length].copy())
+        curr += length
+    return segments
+
+
+def get_onset_segments(y, sr, min_dur_sec=None, max_dur_sec=None):
     """Taglia ai transienti reali dell'audio (attacchi di nota, percussioni, cambi bruschi
     di energia) invece che su un grid rigido o su durate casuali. Stesso principio del
     backtrack sugli onset già usato in R13, qui applicato alla detection mono e poi
-    proiettato sul taglio stereo. y ha shape (2, n)."""
+    proiettato sul taglio stereo. y ha shape (2, n).
+    min_dur_sec/max_dur_sec (opzionali) scartano i segmenti troppo corti/lunghi risultanti
+    dalla detection, per dare comunque un minimo di controllo sulla durata dei tagli."""
     total_samples = y.shape[1]
     if total_samples < MIN_SEGMENT_SAMPLES * 2:
         return []
@@ -127,17 +153,26 @@ def get_onset_segments(y, sr):
         length = end - start
         if length < MIN_SEGMENT_SAMPLES:
             continue
+        dur = length / sr
+        if min_dur_sec is not None and dur < min_dur_sec:
+            continue
+        if max_dur_sec is not None and dur > max_dur_sec:
+            continue
         segments.append(y[:, start:end].copy())
     return segments
 
 
-def get_leader_cut_lengths(y_leader, sr, leader_mode, tempo=None, num_beats=None):
+def get_leader_cut_lengths(y_leader, sr, leader_mode, tempo=None, num_beats=None,
+                            beats_range=None, onset_min_dur=None, onset_max_dur=None):
     """Ricava dal deck 'leader' solo le LUNGHEZZE dei tagli (non l'audio), da imporre
     poi a tutti gli altri deck: e' la 'struttura' che i follower devono rispettare."""
     if leader_mode == "onset":
-        segs = get_onset_segments(y_leader, sr)
+        segs = get_onset_segments(y_leader, sr, onset_min_dur, onset_max_dur)
     else:  # "bpm"
-        segs = get_beat_segments(y_leader, sr, tempo, num_beats)
+        if beats_range is not None:
+            segs = get_beat_segments_range(y_leader, sr, tempo, beats_range[0], beats_range[1])
+        else:
+            segs = get_beat_segments(y_leader, sr, tempo, num_beats)
     return [s.shape[1] for s in segs]
 
 
@@ -308,6 +343,14 @@ for row_idx in [0, 4]:
                     # con parametri diversi serve ricaricare il file.
                     st.success(f"{up.name}")
                     st.caption("💾 RAM liberata — i segmenti già estratti restano disponibili per il mix.")
+                    if st.button(f"🔄 Ricarica in RAM Deck {k.upper()}", key=f"reload_{k}"):
+                        # analyze_track e' decorata con @st.cache_data: se il file non e' cambiato,
+                        # questa chiamata NON rianalizza da zero, recupera solo il risultato già
+                        # calcolato in precedenza — quindi è praticamente istantanea.
+                        y, sr, t = analyze_track(up)
+                        st.session_state.decks[k]['y'] = y
+                        st.session_state.decks[k]['sr'] = sr
+                        st.rerun()
 
 st.sidebar.header("🎛️ Pannello di Controllo")
 active_decks = {k: v for k, v in st.session_state.decks.items() if v['y'] is not None}
@@ -329,8 +372,21 @@ if active_decks:
                       # ora che le modalità sono 4 e non più solo BPM/Casuale)
 
     if tipo_taglio == "Ritmo Musicale (BPM)":
-        beats = st.sidebar.selectbox("Battute per segmento:", [0.5, 1, 2, 4, 8], index=2)
-        taglio_meta = {"modalita": "bpm", "beats": beats}
+        usa_range_battute = st.sidebar.checkbox(
+            "🎲 Usa un range di battute invece di un valore fisso",
+            value=False,
+            help="Invece di tagliare sempre alla stessa lunghezza (es. sempre 2 battute), "
+                 "ogni taglio pesca una lunghezza casuale nel range che imposti (es. tra 1 e 2 battute)."
+        )
+        if usa_range_battute:
+            beats_range = st.sidebar.slider(
+                "Battute per segmento (min-max):", 0.25, 8.0, (1.0, 2.0), step=0.25
+            )
+            beats = None
+        else:
+            beats = st.sidebar.selectbox("Battute per segmento:", [0.5, 1, 2, 4, 8], index=2)
+            beats_range = None
+        taglio_meta = {"modalita": "bpm", "beats": beats, "beats_range": list(beats_range) if beats_range else None}
         apply_stretch = st.sidebar.checkbox(
             "🎚️ Correggi davvero il tempo (time-stretch)",
             value=False,
@@ -351,7 +407,10 @@ if active_decks:
                     with st.spinner(f"Time-stretch Deck {k.upper()} (rate {rate:.3f}x)..."):
                         y_for_cut = time_stretch_stereo(d['y'], rate)
                     stretched_decks += 1
-                segs = get_beat_segments(y_for_cut, d['sr'], d['tempo'], beats)
+                if beats_range is not None:
+                    segs = get_beat_segments_range(y_for_cut, d['sr'], d['tempo'], beats_range[0], beats_range[1])
+                else:
+                    segs = get_beat_segments(y_for_cut, d['sr'], d['tempo'], beats)
                 for s in segs:
                     st.session_state.segments.append({'audio': s, 'sr': d['sr'], 'deck': k})
             invalidate_mix()
@@ -381,18 +440,23 @@ if active_decks:
                 st.sidebar.info("Nessun segmento creato: prova un range di durata più ampio o più corto.")
 
     elif tipo_taglio == "🎯 Slice per Transienti (Onset)":
-        taglio_meta = {"modalita": "onset"}
         st.sidebar.caption(
             "Taglia ogni deck nei suoi punti di attacco reali (percussioni, note, cambi di energia) "
             "invece che su un grid fisso o su durate casuali. Ogni deck produce segmenti di lunghezza "
-            "naturale e diversa, dettata dal contenuto stesso."
+            "naturale, dettata dal contenuto stesso — qui puoi solo scartare quelli troppo corti o lunghi."
         )
+        onset_range = st.sidebar.slider(
+            "Durata segmenti accettata (sec):", 0.02, 5.0, (0.08, 2.0), step=0.02,
+            help="I transienti rilevati fuori da questo range vengono scartati. Non forza tutti i "
+                 "segmenti alla stessa durata: filtra solo gli estremi."
+        )
+        taglio_meta = {"modalita": "onset", "durata_range_sec": list(onset_range)}
         if st.sidebar.button("⚡ Slice ai Transienti"):
             st.session_state.segments = []
             decks_senza_transienti = []
             for k, d in active_decks.items():
                 with st.spinner(f"Rilevo transienti Deck {k.upper()}..."):
-                    segs = get_onset_segments(d['y'], d['sr'])
+                    segs = get_onset_segments(d['y'], d['sr'], onset_range[0], onset_range[1])
                 if not segs:
                     decks_senza_transienti.append(k.upper())
                 for s in segs:
@@ -402,8 +466,8 @@ if active_decks:
                 st.sidebar.success(f"Creati {len(st.session_state.segments)} frammenti dai transienti!")
                 if decks_senza_transienti:
                     st.sidebar.info(
-                        f"Deck {', '.join(decks_senza_transienti)}: nessun transiente chiaro trovato "
-                        "(es. drone, rumore costante) — nessun segmento da lì, non è un errore."
+                        f"Deck {', '.join(decks_senza_transienti)}: nessun transiente nel range di durata "
+                        "impostato (prova ad allargarlo) — nessun segmento da lì, non è un errore."
                     )
             else:
                 st.sidebar.info(
@@ -429,9 +493,21 @@ if active_decks:
             horizontal=True
         )
         leader_beats = None
+        leader_beats_range = None
+        leader_onset_range = None
         apply_bpm_align = False
         if leader_submode == "BPM":
-            leader_beats = st.sidebar.selectbox("Battute per segmento (leader):", [0.5, 1, 2, 4, 8], index=2)
+            leader_usa_range = st.sidebar.checkbox(
+                "🎲 Range di battute per il leader (invece di un valore fisso)", value=False,
+                key="leader_range_toggle"
+            )
+            if leader_usa_range:
+                leader_beats_range = st.sidebar.slider(
+                    "Battute per segmento leader (min-max):", 0.25, 8.0, (1.0, 2.0), step=0.25,
+                    key="leader_beats_range"
+                )
+            else:
+                leader_beats = st.sidebar.selectbox("Battute per segmento (leader):", [0.5, 1, 2, 4, 8], index=2)
             apply_bpm_align = st.sidebar.checkbox(
                 "🎚️ Allinea davvero il BPM dei follower al leader (time-stretch)",
                 value=False,
@@ -441,12 +517,19 @@ if active_decks:
                      "viene prima accelerato/rallentato (intonazione preservata) per portarlo davvero "
                      "al BPM del leader, poi tagliato. Più lento da calcolare, lievi artefatti."
             )
+        else:
+            leader_onset_range = st.sidebar.slider(
+                "Durata tagli leader accettata (sec):", 0.02, 5.0, (0.08, 2.0), step=0.02,
+                key="leader_onset_range"
+            )
 
         taglio_meta = {
             "modalita": "leader_followers",
             "leader": leader_key,
             "leader_submode": leader_submode,
             "leader_beats": leader_beats,
+            "leader_beats_range": list(leader_beats_range) if leader_beats_range else None,
+            "leader_onset_range": list(leader_onset_range) if leader_onset_range else None,
             "bpm_align": apply_bpm_align,
         }
 
@@ -456,7 +539,10 @@ if active_decks:
             with st.spinner(f"Calcolo la struttura dal Deck {leader_key.upper()}..."):
                 lengths = get_leader_cut_lengths(
                     leader_d['y'], leader_d['sr'], leader_mode,
-                    tempo=leader_d['tempo'], num_beats=leader_beats
+                    tempo=leader_d['tempo'], num_beats=leader_beats,
+                    beats_range=leader_beats_range,
+                    onset_min_dur=leader_onset_range[0] if leader_onset_range else None,
+                    onset_max_dur=leader_onset_range[1] if leader_onset_range else None,
                 )
             if not lengths:
                 st.sidebar.info(
