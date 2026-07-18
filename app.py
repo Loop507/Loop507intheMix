@@ -429,14 +429,25 @@ if active_decks:
             horizontal=True
         )
         leader_beats = None
+        apply_bpm_align = False
         if leader_submode == "BPM":
             leader_beats = st.sidebar.selectbox("Battute per segmento (leader):", [0.5, 1, 2, 4, 8], index=2)
+            apply_bpm_align = st.sidebar.checkbox(
+                "🎚️ Allinea davvero il BPM dei follower al leader (time-stretch)",
+                value=False,
+                help="Senza questa opzione, i follower vengono tagliati alle stesse LUNGHEZZE del "
+                     "leader ma continuano a suonare alla loro velocità originale — la struttura è "
+                     "sincronizzata, il tempo musicale no. Con questa opzione attiva, ogni follower "
+                     "viene prima accelerato/rallentato (intonazione preservata) per portarlo davvero "
+                     "al BPM del leader, poi tagliato. Più lento da calcolare, lievi artefatti."
+            )
 
         taglio_meta = {
             "modalita": "leader_followers",
             "leader": leader_key,
             "leader_submode": leader_submode,
             "leader_beats": leader_beats,
+            "bpm_align": apply_bpm_align,
         }
 
         if st.sidebar.button("👑 Applica Struttura del Leader"):
@@ -455,18 +466,31 @@ if active_decks:
             else:
                 st.session_state.segments = []
                 follower_vuoti = []
+                allineati = 0
                 for k, d in active_decks.items():
-                    segs = apply_cut_lengths(d['y'], lengths)
+                    y_for_cut = d['y']
+                    # Allineo il BPM reale del follower a quello del leader solo se: l'utente lo ha
+                    # attivato, siamo in sotto-modo BPM (ha senso solo con un riferimento numerico),
+                    # non è il leader stesso, e il follower ha un BPM effettivo valido da cui partire.
+                    if apply_bpm_align and leader_mode == "bpm" and k != leader_key and d['tempo'] > 0:
+                        rate = leader_d['tempo'] / d['tempo']
+                        with st.spinner(f"Allineo BPM Deck {k.upper()} al leader (rate {rate:.3f}x)..."):
+                            y_for_cut = time_stretch_stereo(d['y'], rate)
+                        allineati += 1
+                    segs = apply_cut_lengths(y_for_cut, lengths)
                     if not segs:
                         follower_vuoti.append(k.upper())
                     for s in segs:
                         st.session_state.segments.append({'audio': s, 'sr': d['sr'], 'deck': k})
                 invalidate_mix()
                 if st.session_state.segments:
-                    st.sidebar.success(
+                    msg = (
                         f"Struttura del Deck {leader_key.upper()} ({len(lengths)} tagli) imposta a "
                         f"{len(active_decks)} deck — {len(st.session_state.segments)} segmenti totali."
                     )
+                    if allineati:
+                        msg += f" BPM realmente allineato su {allineati} follower."
+                    st.sidebar.success(msg)
                     if follower_vuoti:
                         st.sidebar.info(
                             f"Deck {', '.join(follower_vuoti)}: troppo corti per seguire questa struttura, "
