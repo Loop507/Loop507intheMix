@@ -247,6 +247,40 @@ def concat_with_crossfade(segments, crossfade_samples):
     return result
 
 
+def build_dj_remix_overlay(leader_y, overlay_segments, overlay_gain, num_events, rng, deck_weights=None):
+    """Costruisce un mix 'letto + overlay': leader_y resta INTATTO come base (nessun taglio),
+    e sopra vengono sparsi num_events frammenti presi da overlay_segments, sommati (non
+    concatenati) a un punto casuale ciascuno, moltiplicati per overlay_gain. Se un frammento
+    supera la fine del buffer semplicemente non viene piazzato lì (si ripesca un altro punto
+    non serve: si salta, il buffer resta lungo esattamente quanto il leader)."""
+    buffer = leader_y.astype(np.float64).copy()
+    total = buffer.shape[1]
+    if not overlay_segments or total == 0:
+        return buffer
+
+    weights_list = None
+    if deck_weights:
+        counts = {}
+        for s in overlay_segments:
+            counts[s['deck']] = counts.get(s['deck'], 0) + 1
+        weights_list = [deck_weights.get(s['deck'], 5) / max(1, counts.get(s['deck'], 1)) for s in overlay_segments]
+
+    placed = 0
+    attempts = 0
+    max_attempts = max(500, num_events * 20)  # guardia anti-loop-infinito, stessa logica del bug #2
+    while placed < num_events and attempts < max_attempts:
+        attempts += 1
+        pick = rng.choices(overlay_segments, weights=weights_list, k=1)[0] if weights_list else rng.choice(overlay_segments)
+        seg = pick['audio']
+        seg_len = seg.shape[1]
+        if seg_len <= 0 or seg_len > total:
+            continue
+        start = rng.randint(0, total - seg_len)
+        buffer[:, start:start + seg_len] += seg.astype(np.float64) * overlay_gain
+        placed += 1
+    return buffer, placed
+
+
 def estimate_memory_mb(y):
     """Stima approssimativa della RAM occupata da un array audio (utile per avvisare
     l'utente prima che Streamlit Cloud vada in affanno con troppi deck lunghi)."""
@@ -598,13 +632,45 @@ if active_decks:
             for dk in contributing_decks:
                 deck_weights[dk] = st.slider(f"Deck {dk.upper()}", 1, 10, 5, key=f"weight_{dk}")
 
+        apply_dj_remix = st.sidebar.checkbox(
+            "🎙️ Modalità DJ Remix (leader intatto + overlay)",
+            value=False,
+            help="Un deck resta la traccia intera, non tagliata: fa da base. Sopra ci vengono "
+                 "sparsi, sovrapposti (non incollati in sequenza), i frammenti degli ALTRI deck. "
+                 "La durata del mix diventa quella del leader, non un valore a piacere."
+        )
+
+        dj_leader_key = None
+        overlay_gain = 0.6
+        num_overlay_events = 60
+        if apply_dj_remix:
+            dj_leader_key = st.sidebar.selectbox(
+                "Deck da tenere intatto (base):",
+                options=list(active_decks.keys()),
+                format_func=lambda k: f"Deck {k.upper()}",
+                key="dj_leader_key"
+            )
+            overlay_gain = st.sidebar.slider(
+                "🔊 Volume overlay (rispetto al leader):", 0.1, 1.5, 0.6, step=0.05,
+                help="Sotto 1.0 = gli overlay stanno 'sotto' il leader nel mix. Sopra 1.0 = lo sovrastano."
+            )
+            num_overlay_events = st.sidebar.slider(
+                "🎯 Densità overlay (numero di frammenti sparsi):", 5, 400, 60
+            )
+            st.sidebar.caption(
+                f"I frammenti verranno presi da tutti i deck TRANNE {dj_leader_key.upper() if dj_leader_key else '—'} "
+                "(quello resta la base intatta)."
+            )
+
         apply_crossfade = st.sidebar.checkbox(
             "🎛️ Crossfade tra i tagli",
             value=False,
+            disabled=apply_dj_remix,
             help="Breve dissolvenza incrociata tra un segmento e il successivo, per evitare "
-                 "click/pop secchi. Disattivalo se vuoi l'effetto glitch più tagliente e crudo."
+                 "click/pop secchi. Disattivalo se vuoi l'effetto glitch più tagliente e crudo. "
+                 "Non si applica in Modalità DJ Remix (qui si sovrappone, non si concatena)."
         )
-        crossfade_ms = st.sidebar.slider("Durata crossfade (ms)", 1, 100, 15, disabled=not apply_crossfade) if apply_crossfade else 0
+        crossfade_ms = st.sidebar.slider("Durata crossfade (ms)", 1, 100, 15, disabled=not apply_crossfade or apply_dj_remix) if apply_crossfade and not apply_dj_remix else 0
 
         seed_input = st.sidebar.number_input(
             "🎲 Seed (0 = casuale ogni volta)", min_value=0, value=0, step=1,
@@ -612,81 +678,118 @@ if active_decks:
                  "salvato nel preset scaricabile, così puoi ritrovare un mix riuscito per caso."
         )
 
-        durata_mix = st.sidebar.number_input("Durata Mix Finale (sec):", 10, 600, 60)
+        if not apply_dj_remix:
+            durata_mix = st.sidebar.number_input("Durata Mix Finale (sec):", 10, 600, 60)
+        else:
+            durata_mix = None  # in DJ Remix la durata è quella del leader, non impostabile
 
         if st.sidebar.button("🚀 GENERA MIX FINALE"):
             with st.spinner("Rimescolando il mazzo..."):
                 seed_used = seed_input if seed_input > 0 else random.randint(1, 2**31 - 1)
                 rng = random.Random(seed_used)  # RNG locale e seedato: rende il mix riproducibile
-
-                all_segs = list(st.session_state.segments)
-                rng.shuffle(all_segs)
-
-                # Tutti i deck sono già a TARGET_SR grazie al fix in analyze_track,
-                # ma manteniamo un controllo esplicito e un fallback difensivo (fix bug #1).
                 ref_sr = TARGET_SR
-                mismatched = [s for s in all_segs if s['sr'] != ref_sr]
-                if mismatched:
-                    st.sidebar.warning(
-                        f"{len(mismatched)} segmenti con sample rate diversa da {ref_sr}Hz: "
-                        "verranno ricampionati per evitare artefatti di pitch/velocità."
-                    )
-                    for s in mismatched:
-                        # librosa.resample ricampiona lungo l'ultimo asse: funziona correttamente
-                        # anche su array stereo (2, n) senza mescolare i canali.
-                        s['audio'] = librosa.resample(s['audio'], orig_sr=s['sr'], target_sr=ref_sr)
-                        s['sr'] = ref_sr
 
-                chosen = []
-                curr_samples = 0
-                target_samples = durata_mix * ref_sr
+                if apply_dj_remix:
+                    # --- RAMO DJ REMIX: leader intatto come base, overlay sopra ---
+                    dj_leader_d = active_decks[dj_leader_key]
+                    overlay_pool = [s for s in st.session_state.segments if s['deck'] != dj_leader_key]
 
-                # Peso effettivo per segmento: peso_deck diviso per quanti segmenti quel deck
-                # ha prodotto, cosi' il peso impostato dall'utente vale per il deck nel suo
-                # complesso e non viene "diluito" se il deck ha tanti segmenti piccoli.
-                deck_counts = {}
-                for s in all_segs:
-                    deck_counts[s['deck']] = deck_counts.get(s['deck'], 0) + 1
-                weights_list = [
-                    deck_weights.get(s['deck'], 5) / max(1, deck_counts.get(s['deck'], 1))
-                    for s in all_segs
-                ]
+                    if not overlay_pool:
+                        st.sidebar.error(
+                            f"Nessun segmento disponibile dagli altri deck per l'overlay: servono "
+                            f"segmenti già tagliati da almeno un deck diverso da {dj_leader_key.upper()}."
+                        )
+                        chosen = []
+                    else:
+                        # Ricampiono eventuali segmenti overlay con sr diverso da quello del leader.
+                        mismatched = [s for s in overlay_pool if s['sr'] != dj_leader_d['sr']]
+                        if mismatched:
+                            for s in mismatched:
+                                s['audio'] = librosa.resample(s['audio'], orig_sr=s['sr'], target_sr=dj_leader_d['sr'])
+                                s['sr'] = dj_leader_d['sr']
+                        ref_sr = dj_leader_d['sr']
+                        final_y, eventi_piazzati = build_dj_remix_overlay(
+                            dj_leader_d['y'], overlay_pool, overlay_gain, num_overlay_events, rng, deck_weights
+                        )
+                        chosen = [True]  # solo per riusare il check "if not chosen" sotto
+                else:
+                    # --- RAMO CLASSICO: shuffle + concatenazione (+ crossfade opzionale) ---
+                    all_segs = list(st.session_state.segments)
+                    rng.shuffle(all_segs)
 
-                # Guardia anti-loop-infinito (fix bug #2): esce comunque dopo un numero
-                # ragionevole di tentativi anche se, per qualche motivo, i segmenti
-                # scelti non facessero avanzare il conteggio.
-                max_attempts = max(1000, len(all_segs) * 50)
-                attempts = 0
-                while curr_samples < target_samples and attempts < max_attempts:
-                    pick = rng.choices(all_segs, weights=weights_list, k=1)[0]
-                    # shape[1] = lunghezza temporale del segmento stereo (2, n): NON usare len(),
-                    # che su un array (2, n) restituirebbe 2 (il numero di canali) invece della durata.
-                    seg_len = pick['audio'].shape[1]
-                    if seg_len > 0:
-                        chosen.append(pick['audio'])
-                        curr_samples += seg_len
-                    attempts += 1
+                    # Tutti i deck sono già a TARGET_SR grazie al fix in analyze_track,
+                    # ma manteniamo un controllo esplicito e un fallback difensivo (fix bug #1).
+                    mismatched = [s for s in all_segs if s['sr'] != ref_sr]
+                    if mismatched:
+                        st.sidebar.warning(
+                            f"{len(mismatched)} segmenti con sample rate diversa da {ref_sr}Hz: "
+                            "verranno ricampionati per evitare artefatti di pitch/velocità."
+                        )
+                        for s in mismatched:
+                            # librosa.resample ricampiona lungo l'ultimo asse: funziona correttamente
+                            # anche su array stereo (2, n) senza mescolare i canali.
+                            s['audio'] = librosa.resample(s['audio'], orig_sr=s['sr'], target_sr=ref_sr)
+                            s['sr'] = ref_sr
+
+                    chosen = []
+                    curr_samples = 0
+                    target_samples = durata_mix * ref_sr
+
+                    # Peso effettivo per segmento: peso_deck diviso per quanti segmenti quel deck
+                    # ha prodotto, cosi' il peso impostato dall'utente vale per il deck nel suo
+                    # complesso e non viene "diluito" se il deck ha tanti segmenti piccoli.
+                    deck_counts = {}
+                    for s in all_segs:
+                        deck_counts[s['deck']] = deck_counts.get(s['deck'], 0) + 1
+                    weights_list = [
+                        deck_weights.get(s['deck'], 5) / max(1, deck_counts.get(s['deck'], 1))
+                        for s in all_segs
+                    ]
+
+                    # Guardia anti-loop-infinito (fix bug #2): esce comunque dopo un numero
+                    # ragionevole di tentativi anche se, per qualche motivo, i segmenti
+                    # scelti non facessero avanzare il conteggio.
+                    max_attempts = max(1000, len(all_segs) * 50)
+                    attempts = 0
+                    while curr_samples < target_samples and attempts < max_attempts:
+                        pick = rng.choices(all_segs, weights=weights_list, k=1)[0]
+                        # shape[1] = lunghezza temporale del segmento stereo (2, n): NON usare len(),
+                        # che su un array (2, n) restituirebbe 2 (il numero di canali) invece della durata.
+                        seg_len = pick['audio'].shape[1]
+                        if seg_len > 0:
+                            chosen.append(pick['audio'])
+                            curr_samples += seg_len
+                        attempts += 1
+
+                    if chosen:
+                        # Concatenazione lungo l'asse temporale, con crossfade opzionale per
+                        # evitare i click secchi tra un segmento e il successivo.
+                        crossfade_samples = int(ref_sr * crossfade_ms / 1000) if apply_crossfade else 0
+                        final_y = concat_with_crossfade(chosen, crossfade_samples)
+                        eventi_piazzati = len(chosen)
 
                 if not chosen:
                     st.sidebar.error("Impossibile generare il mix: nessun segmento valido disponibile.")
                 else:
-                    # Concatenazione lungo l'asse temporale, con crossfade opzionale per
-                    # evitare i click secchi tra un segmento e il successivo.
-                    crossfade_samples = int(ref_sr * crossfade_ms / 1000) if apply_crossfade else 0
-                    final_y = concat_with_crossfade(chosen, crossfade_samples)
                     out = export_audio(final_y, ref_sr)
+                    durata_effettiva = final_y.shape[1] / ref_sr
 
                     # --- PRESET RIPRODUCIBILE (seed + parametri) ---
-                    taglio_dettaglio = taglio_meta
                     preset = {
                         "loop507_hyper_mixer_preset": True,
-                        "versione_app": "4.0",
+                        "versione_app": "5.0",
                         "seed": seed_used,
                         "modalita_taglio": tipo_taglio,
-                        "parametro_taglio": taglio_dettaglio,
-                        "crossfade_ms": crossfade_ms if apply_crossfade else 0,
+                        "parametro_taglio": taglio_meta,
+                        "dj_remix": {
+                            "attivo": apply_dj_remix,
+                            "leader": dj_leader_key,
+                            "overlay_gain": overlay_gain,
+                            "num_eventi": num_overlay_events,
+                        } if apply_dj_remix else None,
+                        "crossfade_ms": crossfade_ms if (apply_crossfade and not apply_dj_remix) else 0,
                         "pesi_deck": deck_weights,
-                        "durata_mix_sec": durata_mix,
+                        "durata_mix_sec": round(durata_effettiva, 2),
                         "deck": [
                             {"deck": k, "file": d['name'], "bpm_usato": d['tempo']}
                             for k, d in active_decks.items()
@@ -701,9 +804,20 @@ if active_decks:
 
                     # --- GENERAZIONE REPORT BRANDIZZATO BILINGUE ---
                     ts_audio = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    if apply_dj_remix:
+                        processo_it = f"DJ Remix: Deck {dj_leader_key.upper()} intatto come base / {eventi_piazzati} overlay sparsi (seed {seed_used}) / Cross-Deck Fragmentation / Stereo Preservato"
+                        processo_en = f"DJ Remix: Deck {dj_leader_key.upper()} kept intact as base / {eventi_piazzati} scattered overlays (seed {seed_used}) / Cross-Deck Fragmentation / Stereo Preserved"
+                        extra_it = f"* Deck Base (intatto): {dj_leader_key.upper()}\n* Overlay Piazzati: {eventi_piazzati} (volume {overlay_gain:.2f}x)"
+                        extra_en = f"* Base Deck (intact): {dj_leader_key.upper()}\n* Overlays Placed: {eventi_piazzati} (gain {overlay_gain:.2f}x)"
+                    else:
+                        processo_it = f"Shuffling Ricorsivo (seed {seed_used}) / Cross-Deck Fragmentation / Sample Rate Uniformato / Stereo Preservato / Pesi Deck Personalizzati"
+                        processo_en = f"Recursive Shuffling (seed {seed_used}) / Cross-Deck Fragmentation / Uniform Sample Rate / Stereo Preserved / Custom Deck Weights"
+                        extra_it = f"* Crossfade: {f'{crossfade_ms}ms' if apply_crossfade else 'disattivato'}"
+                        extra_en = f"* Crossfade: {f'{crossfade_ms}ms' if apply_crossfade else 'disabled'}"
+
                     st.session_state.audio_report = f"""
 ╔════════════════════════════════════════════════════════════════╗
-  HYPER-MIXER v4.0 - AUDIO RECONSTRUCTION LOG (STEREO + TIME-STRETCH + CROSSFADE)
+  HYPER-MIXER v5.0 - AUDIO RECONSTRUCTION LOG (STEREO + DJ REMIX)
   Generated on: {ts_audio}
 ╚════════════════════════════════════════════════════════════════╝
 
@@ -711,39 +825,39 @@ if active_decks:
 
 ═══════════════════ ITALIANO ═══════════════════
 
-:: ENGINE: hyper_mixer_loop507 [v4.0]
-:: ANALISI: Beat Tracking (Librosa) / RMS Envelope
+:: ENGINE: hyper_mixer_loop507 [v5.0]
+:: ANALISI: Beat Tracking (Librosa) / RMS Envelope / Onset Detection
 :: STILE: Audio-Glitch / Granular Synthesis
-:: PROCESSO: Shuffling Ricorsivo (seed {seed_used}) / Cross-Deck Fragmentation / Sample Rate Uniformato / Stereo Preservato / Pesi Deck Personalizzati
+:: PROCESSO: {processo_it}
 
 "Audio-Data fragment: Il ritmo è solo una variabile manipolata dal caos."
 
 > SCHEDA TECNICA:
 * Deck Attivi: {len(active_decks)} sorgenti caricate
 * Pool Segmenti: {len(st.session_state.segments)} campioni estratti
-* Modalità: {tipo_taglio}
+* Modalità Taglio: {tipo_taglio}
 * Campionamento: {ref_sr} Hz / Stereo (L/R preservati, mono duplicato se sorgente mono)
-* Crossfade: {f"{crossfade_ms}ms" if apply_crossfade else "disattivato"}
+{extra_it}
 * Seed: {seed_used}
-* Durata Output: {durata_mix}s
+* Durata Output: {durata_effettiva:.1f}s
 
 ═══════════════════ ENGLISH ═══════════════════
 
-:: ENGINE: hyper_mixer_loop507 [v4.0]
-:: ANALYSIS: Beat Tracking (Librosa) / RMS Envelope
+:: ENGINE: hyper_mixer_loop507 [v5.0]
+:: ANALYSIS: Beat Tracking (Librosa) / RMS Envelope / Onset Detection
 :: STYLE: Audio-Glitch / Granular Synthesis
-:: PROCESS: Recursive Shuffling (seed {seed_used}) / Cross-Deck Fragmentation / Uniform Sample Rate / Stereo Preserved / Custom Deck Weights
+:: PROCESS: {processo_en}
 
 "Audio-Data fragment: Rhythm is just a variable manipulated by chaos."
 
 > TECHNICAL LOG SHEET:
 * Active Decks: {len(active_decks)} loaded sources
 * Segments Pool: {len(st.session_state.segments)} extracted samples
-* Mode: {tipo_taglio}
+* Cut Mode: {tipo_taglio}
 * Sampling: {ref_sr} Hz / Stereo (L/R preserved, mono duplicated if source was mono)
-* Crossfade: {f"{crossfade_ms}ms" if apply_crossfade else "disabled"}
+{extra_en}
 * Seed: {seed_used}
-* Output Duration: {durata_mix}s
+* Output Duration: {durata_effettiva:.1f}s
 
 > Regia e Algoritmo / Direction & Algorithm: Loop507
 
@@ -769,4 +883,4 @@ if st.session_state.get('mix_ready'):
         )
 
 st.markdown("---")
-st.caption("Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva | Stereo + Time-Stretch + Crossfade v4.0")
+st.caption("Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva | Stereo + DJ Remix v5.0")
