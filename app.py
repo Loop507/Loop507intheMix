@@ -37,6 +37,42 @@ MAX_SEGMENT_SECONDS = 30           # tetto di sicurezza per singolo segmento
 # I brani mono vengono duplicati sui due canali in fase di analisi, cosi' tutta la pipeline
 # a valle (taglio, shuffle, export) lavora sempre e solo su array stereo, senza casi speciali.
 
+def refine_tempo_from_beats(beat_samples, sr, fallback_tempo):
+    """Il BPM restituito da beat_track è una stima algoritmica globale, spesso imprecisa.
+    Le posizioni dei singoli beat rilevati sono generalmente più affidabili: calcoliamo la
+    MEDIANA (non la media, per non farci rovinare da un singolo colpo fuori tempo) degli
+    intervalli reali tra un beat e il successivo, e ne ricaviamo un BPM più preciso."""
+    if beat_samples is None or len(beat_samples) < 4:
+        return fallback_tempo  # troppo pochi beat per una stima affidabile: meglio il fallback
+    beat_samples_sorted = np.sort(np.asarray(beat_samples, dtype=np.float64))
+    intervals_sec = np.diff(beat_samples_sorted) / sr
+    intervals_sec = intervals_sec[intervals_sec > 0]
+    if len(intervals_sec) == 0:
+        return fallback_tempo
+    median_interval = np.median(intervals_sec)
+    if median_interval <= 0:
+        return fallback_tempo
+    return 60.0 / median_interval
+
+
+def correggi_errore_ottava(tempo_val, bpm_min, bpm_max):
+    """I beat-tracker confondono spesso il doppio o la metà del BPM reale (es. rilevano 70
+    invece di 140, o viceversa) — è l'errore più comune di questi algoritmi. Se il BPM
+    rilevato cade fuori dal range plausibile impostato, lo dimezza/raddoppia finché non
+    rientra, invece di lasciarlo palesemente sbagliato."""
+    if tempo_val is None or tempo_val <= 0:
+        return tempo_val
+    t = tempo_val
+    guard = 0  # sicurezza anti-loop, non dovrebbe mai servire con range ragionevoli
+    while t > bpm_max and t / 2 >= bpm_min and guard < 10:
+        t /= 2
+        guard += 1
+    while t < bpm_min and t * 2 <= bpm_max and guard < 10:
+        t *= 2
+        guard += 1
+    return t
+
+
 @st.cache_data
 def analyze_track(audio_file_object):
     """Analizza un file audio: carica in stereo, converte in WAV temporaneo, rileva tempo.
@@ -59,8 +95,11 @@ def analyze_track(audio_file_object):
 
         # Il beat tracking lavora su un segnale mono: usiamo la media dei due canali solo per l'analisi.
         y_mono_for_beat = np.mean(y, axis=0)
-        tempo, _ = librosa.beat.beat_track(y=y_mono_for_beat, sr=sr)
-        tempo_val = float(tempo[0]) if isinstance(tempo, np.ndarray) else float(tempo)
+        tempo_raw, beat_samples = librosa.beat.beat_track(y=y_mono_for_beat, sr=sr, units="samples")
+        tempo_raw_val = float(tempo_raw[0]) if isinstance(tempo_raw, np.ndarray) else float(tempo_raw)
+        # Raffino il BPM globale con la mediana degli intervalli reali tra i beat rilevati:
+        # più preciso della singola stima algoritmica di beat_track (fix precisione BPM).
+        tempo_val = refine_tempo_from_beats(beat_samples, sr, tempo_raw_val)
         return y, sr, tempo_val
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -421,6 +460,18 @@ if 'segments' not in st.session_state:
 if 'audio_report' not in st.session_state:
     st.session_state.audio_report = ""
 
+st.sidebar.header("⚙️ Precisione BPM")
+correggi_ottava = st.sidebar.checkbox(
+    "Correggi errori di ottava", value=True,
+    help="I beat-tracker confondono spesso il doppio o la metà del BPM reale (es. 70 invece "
+         "di 140). Se attivo, il BPM rilevato fuori dal range qui sotto viene automaticamente "
+         "dimezzato/raddoppiato per rientrarci. Disattivalo per generi con BPM legittimamente "
+         "molto lenti o molto veloci (es. drone, hardcore estremo)."
+)
+bpm_range_plausibile = st.sidebar.slider(
+    "Range BPM plausibile:", 40, 220, (70, 180), disabled=not correggi_ottava
+)
+
 deck_keys = list(st.session_state.decks.keys())
 for row_idx in [0, 4]:
     cols = st.columns(4)
@@ -432,6 +483,8 @@ for row_idx in [0, 4]:
                 if st.session_state.decks[k]['name'] != up.name:
                     with st.spinner(f"Analizzando {k.upper()}..."):
                         y, sr, t = analyze_track(up)
+                        if correggi_ottava and t > 0:
+                            t = correggi_errore_ottava(t, bpm_range_plausibile[0], bpm_range_plausibile[1])
                         st.session_state.decks[k] = {
                             'y': y, 'sr': sr, 'tempo': t, 'tempo_detected': t, 'name': up.name
                         }
@@ -970,7 +1023,7 @@ if active_decks:
                     # --- PRESET RIPRODUCIBILE (seed + parametri) ---
                     preset = {
                         "loop507_hyper_mixer_preset": True,
-                        "versione_app": "5.1",
+                        "versione_app": "5.2",
                         "seed": seed_used,
                         "modalita_taglio": tipo_taglio,
                         "parametro_taglio": taglio_meta,
@@ -1017,7 +1070,7 @@ if active_decks:
 
                     st.session_state.audio_report = f"""
 ╔════════════════════════════════════════════════════════════════╗
-  HYPER-MIXER v5.1 - AUDIO RECONSTRUCTION LOG (STEREO + DJ REMIX + MIDI)
+  HYPER-MIXER v5.2 - AUDIO RECONSTRUCTION LOG (STEREO + DJ REMIX + MIDI)
   Generated on: {ts_audio}
 ╚════════════════════════════════════════════════════════════════╝
 
@@ -1025,7 +1078,7 @@ if active_decks:
 
 ═══════════════════ ITALIANO ═══════════════════
 
-:: ENGINE: hyper_mixer_loop507 [v5.1]
+:: ENGINE: hyper_mixer_loop507 [v5.2]
 :: ANALISI: Beat Tracking (Librosa) / RMS Envelope / Onset Detection
 :: STILE: Audio-Glitch / Granular Synthesis
 :: PROCESSO: {processo_it}
@@ -1043,7 +1096,7 @@ if active_decks:
 
 ═══════════════════ ENGLISH ═══════════════════
 
-:: ENGINE: hyper_mixer_loop507 [v5.1]
+:: ENGINE: hyper_mixer_loop507 [v5.2]
 :: ANALYSIS: Beat Tracking (Librosa) / RMS Envelope / Onset Detection
 :: STYLE: Audio-Glitch / Granular Synthesis
 :: PROCESS: {processo_en}
@@ -1101,4 +1154,4 @@ if st.session_state.get('mix_ready'):
             st.caption("🎹 Export MIDI non disponibile: aggiungi 'mido' a requirements.txt.")
 
 st.markdown("---")
-st.caption("Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva | Stereo + DJ Remix + MIDI v5.1")
+st.caption("Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva | Stereo + DJ Remix + MIDI + Precisione BPM v5.2")
