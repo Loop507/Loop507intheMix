@@ -10,6 +10,14 @@ import shutil
 import json
 from datetime import datetime
 
+try:
+    import mido
+    MIDI_DISPONIBILE = True
+except ImportError:
+    # mido non e' nei requirements: l'export MIDI si disattiva da sola invece di far
+    # crashare tutta l'app. Se vedi questo messaggio, aggiungi 'mido' a requirements.txt.
+    MIDI_DISPONIBILE = False
+
 # --- Configurazione FFmpeg ---
 ffmpeg_bin = shutil.which("ffmpeg")
 if ffmpeg_bin:
@@ -247,16 +255,49 @@ def concat_with_crossfade(segments, crossfade_samples):
     return result
 
 
-def build_dj_remix_overlay(leader_y, overlay_segments, overlay_gain, num_events, rng, deck_weights=None):
+def get_beat_grid_samples(y, sr, tempo=None):
+    """Rileva la griglia dei beat del deck (in campioni): e' la 'griglia magnetica' su cui
+    agganciare gli overlay in DJ Remix, cosi' i picchi ritmici dei due audio combaciano
+    davvero, come farebbe un DJ ad orecchio."""
+    y_mono = np.mean(y, axis=0)
+    try:
+        _, beat_samples = librosa.beat.beat_track(y=y_mono, sr=sr, units="samples")
+    except Exception:
+        return []
+    return sorted(beat_samples.tolist()) if len(beat_samples) else []
+
+
+def find_strongest_onset_offset(seg, sr):
+    """Trova, dentro un singolo frammento, la posizione (in campioni) del suo attacco più
+    forte — il suo 'colpo' principale. E' il punto che vogliamo far combaciare esattamente
+    con un beat del leader, non l'inizio arbitrario del frammento."""
+    seg_mono = np.mean(seg, axis=0)
+    try:
+        onsets = librosa.onset.onset_detect(y=seg_mono, sr=sr, backtrack=True, units="samples")
+    except Exception:
+        return 0
+    if len(onsets) == 0:
+        return 0
+    return int(onsets[0])  # il primo transiente e' tipicamente il "punch" principale
+
+
+def build_dj_remix_overlay(leader_y, leader_sr, overlay_segments, overlay_gain, num_events,
+                            rng, deck_weights=None, beatmatch=True):
     """Costruisce un mix 'letto + overlay': leader_y resta INTATTO come base (nessun taglio),
     e sopra vengono sparsi num_events frammenti presi da overlay_segments, sommati (non
-    concatenati) a un punto casuale ciascuno, moltiplicati per overlay_gain. Se un frammento
-    supera la fine del buffer semplicemente non viene piazzato lì (si ripesca un altro punto
-    non serve: si salta, il buffer resta lungo esattamente quanto il leader)."""
+    concatenati), moltiplicati per overlay_gain.
+    Se beatmatch e' attivo: ogni frammento non va a un punto casuale qualsiasi, ma il suo
+    attacco più forte viene agganciato esattamente a un beat della griglia del leader —
+    il vero 'aggancio ai picchi' stile DJ, non solo lo stesso tempo.
+    Ritorna anche la lista degli eventi piazzati (per l'export MIDI della struttura)."""
     buffer = leader_y.astype(np.float64).copy()
     total = buffer.shape[1]
     if not overlay_segments or total == 0:
-        return buffer
+        return buffer, 0, []
+
+    beat_grid = get_beat_grid_samples(leader_y, leader_sr) if beatmatch else []
+    if beatmatch and not beat_grid:
+        beatmatch = False  # il leader non ha un beat rilevabile: fallback a piazzamento casuale
 
     weights_list = None
     if deck_weights:
@@ -268,6 +309,7 @@ def build_dj_remix_overlay(leader_y, overlay_segments, overlay_gain, num_events,
     placed = 0
     attempts = 0
     max_attempts = max(500, num_events * 20)  # guardia anti-loop-infinito, stessa logica del bug #2
+    events = []  # per il report MIDI: (start_sample, deck)
     while placed < num_events and attempts < max_attempts:
         attempts += 1
         pick = rng.choices(overlay_segments, weights=weights_list, k=1)[0] if weights_list else rng.choice(overlay_segments)
@@ -275,10 +317,67 @@ def build_dj_remix_overlay(leader_y, overlay_segments, overlay_gain, num_events,
         seg_len = seg.shape[1]
         if seg_len <= 0 or seg_len > total:
             continue
-        start = rng.randint(0, total - seg_len)
+
+        if beatmatch:
+            beat_pos = rng.choice(beat_grid)
+            # onset_offset e' pre-calcolato su ogni segmento (vedi sotto) per non rifare
+            # la detection ad ogni singolo piazzamento, anche se lo stesso frammento
+            # viene ripescato più volte.
+            onset_offset = pick.get('onset_offset', 0)
+            start = beat_pos - onset_offset
+            if start < 0:
+                start = 0
+            if start + seg_len > total:
+                start = total - seg_len
+                if start < 0:
+                    continue
+        else:
+            start = rng.randint(0, total - seg_len)
+
         buffer[:, start:start + seg_len] += seg.astype(np.float64) * overlay_gain
+        events.append((start, pick['deck']))
         placed += 1
-    return buffer, placed
+    return buffer, placed, events
+
+
+def build_structure_midi(events, sr, tempo_bpm=120.0, base_note=36):
+    """Genera un MIDI 'mappa strutturale' del mix: ogni evento (taglio o overlay) diventa
+    una nota. L'altezza della nota varia per deck (A->36, B->37, ... come un mini drum-kit
+    GM), cosi' aprendo il file in un DAW si vede a colpo d'occhio quale deck ha contribuito
+    a quale istante della struttura. events: lista di (start_sample, deck_letter)."""
+    if not MIDI_DISPONIBILE or not events:
+        return None
+
+    mid = mido.MidiFile()
+    track = mido.MidiTrack()
+    mid.tracks.append(track)
+    tempo_us = mido.bpm2tempo(max(20.0, tempo_bpm))
+    track.append(mido.MetaMessage('set_tempo', tempo=tempo_us, time=0))
+
+    deck_to_note = {letter: base_note + i for i, letter in enumerate('abcdefgh')}
+    note_duration_ticks = int(mido.second2tick(0.08, mid.ticks_per_beat, tempo_us))  # colpo breve
+
+    # Ordino cronologicamente e converto in eventi assoluti su un'unica timeline (note_on / note_off)
+    timeline = []
+    for start_sample, deck in sorted(events, key=lambda e: e[0]):
+        t_sec = start_sample / sr
+        note = deck_to_note.get(deck, base_note)
+        tick_on = int(mido.second2tick(t_sec, mid.ticks_per_beat, tempo_us))
+        timeline.append((tick_on, 'note_on', note))
+        timeline.append((tick_on + note_duration_ticks, 'note_off', note))
+    timeline.sort(key=lambda e: (e[0], 0 if e[1] == 'note_off' else 1))
+
+    prev_tick = 0
+    for tick, kind, note in timeline:
+        delta = max(0, tick - prev_tick)
+        vel = 100 if kind == 'note_on' else 0
+        track.append(mido.Message(kind, note=note, velocity=vel, time=delta))
+        prev_tick = tick
+
+    buffer = BytesIO()
+    mid.save(file=buffer)
+    buffer.seek(0)
+    return buffer
 
 
 def estimate_memory_mb(y):
@@ -293,6 +392,8 @@ def invalidate_mix():
     """Invalida il mix precedente quando i segmenti cambiano (fix bug #4)."""
     st.session_state.pop("mix_ready", None)
     st.session_state.pop("mix_preset", None)
+    st.session_state.pop("mix_events", None)
+    st.session_state.pop("dj_rendered_by_deck", None)
     st.session_state.audio_report = ""
 
 
@@ -343,6 +444,7 @@ for row_idx in [0, 4]:
                         bpm_key = f"bpm_manual_{k}"
                         if bpm_key in st.session_state:
                             del st.session_state[bpm_key]
+                        st.session_state.pop(f"exported_rend_{k}", None)  # export renderizzato del vecchio file non più valido
                 if st.session_state.decks[k]['y'] is not None:
                     st.success(f"{up.name}")
                     mem_mb = estimate_memory_mb(st.session_state.decks[k]['y'])
@@ -363,6 +465,37 @@ for row_idx in [0, 4]:
                     )
                     st.session_state.decks[k]['tempo'] = manual_bpm
                     st.audio(up)
+
+                    if st.button(f"🎛️ Esporta Renderizzato {k.upper()}", key=f"export_rend_{k}", use_container_width=True,
+                                 help="Il deck così com'è DOPO l'ultima elaborazione (taglio, time-stretch, allineamento DJ Remix)."):
+                        with st.spinner(f"Esporto Deck {k.upper()} (renderizzato)..."):
+                            dj_rendered = st.session_state.get('dj_rendered_by_deck')
+                            if dj_rendered and k in dj_rendered.get('audio', {}):
+                                # Priorità al materiale DJ Remix: e' il più "processato"
+                                # (stretch al BPM del leader), altrimenti andrebbe perso.
+                                pieces = dj_rendered['audio'][k]
+                                render_sr = dj_rendered['sr']
+                                render_y = concat_with_crossfade(pieces, 0)
+                                st.session_state[f"exported_rend_{k}"] = export_audio(render_y, render_sr)
+                            else:
+                                # Fallback: concateno i segmenti di questo deck così come
+                                # sono nel pool corrente (riflette l'ultimo taglio fatto,
+                                # incluso l'eventuale time-stretch della modalità BPM).
+                                pieces = [s['audio'] for s in st.session_state.segments if s['deck'] == k]
+                                if pieces:
+                                    render_sr = st.session_state.decks[k]['sr']
+                                    render_y = concat_with_crossfade(pieces, 0)
+                                    st.session_state[f"exported_rend_{k}"] = export_audio(render_y, render_sr)
+                                else:
+                                    st.session_state[f"exported_rend_{k}"] = None
+                                    st.warning(f"Nessun materiale renderizzato per Deck {k.upper()}: taglialo prima con una delle modalità.")
+
+                    if st.session_state.get(f"exported_rend_{k}"):
+                        st.download_button(
+                            f"📥 Scarica Renderizzato {k.upper()}.mp3", st.session_state[f"exported_rend_{k}"],
+                            f"loop507_deck_{k}_renderizzato.mp3", key=f"dl_rend_{k}", use_container_width=True
+                        )
+
                     if st.session_state.segments:
                         # Ha senso liberare la RAM solo dopo aver già estratto i segmenti:
                         # da questo momento i segmenti sono copie indipendenti (fix .copy()),
@@ -643,6 +776,8 @@ if active_decks:
         dj_leader_key = None
         overlay_gain = 0.6
         num_overlay_events = 60
+        dj_bpm_align = True
+        dj_beatmatch = True
         if apply_dj_remix:
             dj_leader_key = st.sidebar.selectbox(
                 "Deck da tenere intatto (base):",
@@ -656,6 +791,18 @@ if active_decks:
             )
             num_overlay_events = st.sidebar.slider(
                 "🎯 Densità overlay (numero di frammenti sparsi):", 5, 400, 60
+            )
+            dj_bpm_align = st.sidebar.checkbox(
+                "🎚️ Allinea automaticamente il BPM di tutti i follower al leader", value=True,
+                help="Attivo di default: ogni deck (tranne il leader) viene accelerato/rallentato "
+                     "col time-stretch per suonare davvero allo stesso tempo del leader, prima "
+                     "di essere sparso come overlay."
+            )
+            dj_beatmatch = st.sidebar.checkbox(
+                "🎯 Aggancia i picchi ritmici (beatmatching)", value=True,
+                help="Attivo di default: ogni frammento overlay non viene piazzato a un punto "
+                     "casuale, ma il suo attacco più forte viene fatto combaciare esattamente "
+                     "con un beat del leader — proprio come farebbe un DJ mixando ad orecchio."
             )
             st.sidebar.caption(
                 f"I frammenti verranno presi da tutti i deck TRANNE {dj_leader_key.upper() if dj_leader_key else '—'} "
@@ -692,26 +839,63 @@ if active_decks:
                 if apply_dj_remix:
                     # --- RAMO DJ REMIX: leader intatto come base, overlay sopra ---
                     dj_leader_d = active_decks[dj_leader_key]
-                    overlay_pool = [s for s in st.session_state.segments if s['deck'] != dj_leader_key]
+                    overlay_pool_raw = [s for s in st.session_state.segments if s['deck'] != dj_leader_key]
 
-                    if not overlay_pool:
+                    if not overlay_pool_raw:
                         st.sidebar.error(
                             f"Nessun segmento disponibile dagli altri deck per l'overlay: servono "
                             f"segmenti già tagliati da almeno un deck diverso da {dj_leader_key.upper()}."
                         )
                         chosen = []
                     else:
+                        ref_sr = dj_leader_d['sr']
                         # Ricampiono eventuali segmenti overlay con sr diverso da quello del leader.
-                        mismatched = [s for s in overlay_pool if s['sr'] != dj_leader_d['sr']]
+                        mismatched = [s for s in overlay_pool_raw if s['sr'] != ref_sr]
                         if mismatched:
                             for s in mismatched:
-                                s['audio'] = librosa.resample(s['audio'], orig_sr=s['sr'], target_sr=dj_leader_d['sr'])
-                                s['sr'] = dj_leader_d['sr']
-                        ref_sr = dj_leader_d['sr']
-                        final_y, eventi_piazzati = build_dj_remix_overlay(
-                            dj_leader_d['y'], overlay_pool, overlay_gain, num_overlay_events, rng, deck_weights
-                        )
+                                s['audio'] = librosa.resample(s['audio'], orig_sr=s['sr'], target_sr=ref_sr)
+                                s['sr'] = ref_sr
+
+                        # --- Auto-allineamento BPM: ogni follower viene stretchato al tempo del
+                        # leader PRIMA di essere sparso come overlay, cosi' suona davvero alla
+                        # stessa velocità (non solo tagliato alla stessa lunghezza). ---
+                        overlay_pool = []
+                        decks_allineati = set()
+                        decks_non_allineabili = set()
+                        for s in overlay_pool_raw:
+                            seg_audio = s['audio']
+                            if dj_bpm_align and dj_leader_d['tempo'] > 0:
+                                follower_tempo = active_decks.get(s['deck'], {}).get('tempo', 0)
+                                if follower_tempo > 0 and abs(dj_leader_d['tempo'] - follower_tempo) > 0.5:
+                                    rate = dj_leader_d['tempo'] / follower_tempo
+                                    seg_audio = time_stretch_stereo(seg_audio, rate)
+                                    decks_allineati.add(s['deck'])
+                                elif follower_tempo <= 0:
+                                    decks_non_allineabili.add(s['deck'])
+                            overlay_pool.append({'audio': seg_audio, 'sr': ref_sr, 'deck': s['deck']})
+
+                        # --- Pre-calcolo dell'attacco più forte di ogni segmento, una volta sola,
+                        # cosi' il beatmatching non deve rifare la detection ad ogni piazzamento
+                        # anche se lo stesso frammento viene ripescato più volte. ---
+                        if dj_beatmatch:
+                            with st.spinner("Rilevo i picchi ritmici per l'aggancio..."):
+                                for s in overlay_pool:
+                                    s['onset_offset'] = find_strongest_onset_offset(s['audio'], ref_sr)
+
+                        with st.spinner("Sovrappongo i frammenti (DJ Remix)..."):
+                            final_y, eventi_piazzati, dj_events = build_dj_remix_overlay(
+                                dj_leader_d['y'], ref_sr, overlay_pool, overlay_gain, num_overlay_events,
+                                rng, deck_weights, beatmatch=dj_beatmatch
+                            )
                         chosen = [True]  # solo per riusare il check "if not chosen" sotto
+
+                        # Salvo il materiale POST-allineamento (stretch al BPM del leader, se
+                        # applicato) raggruppato per deck: e' quello che "Esporta Renderizzato"
+                        # userà, invece dell'audio originale mai toccato.
+                        rendered_by_deck = {}
+                        for s in overlay_pool:
+                            rendered_by_deck.setdefault(s['deck'], []).append(s['audio'])
+                        st.session_state.dj_rendered_by_deck = {'sr': ref_sr, 'audio': rendered_by_deck}
                 else:
                     # --- RAMO CLASSICO: shuffle + concatenazione (+ crossfade opzionale) ---
                     all_segs = list(st.session_state.segments)
@@ -734,6 +918,7 @@ if active_decks:
                     chosen = []
                     curr_samples = 0
                     target_samples = durata_mix * ref_sr
+                    dj_events = []  # riuso lo stesso nome del ramo DJ Remix per il MIDI
 
                     # Peso effettivo per segmento: peso_deck diviso per quanti segmenti quel deck
                     # ha prodotto, cosi' il peso impostato dall'utente vale per il deck nel suo
@@ -757,6 +942,7 @@ if active_decks:
                         # che su un array (2, n) restituirebbe 2 (il numero di canali) invece della durata.
                         seg_len = pick['audio'].shape[1]
                         if seg_len > 0:
+                            dj_events.append((curr_samples, pick['deck']))  # posizione nel mix finale
                             chosen.append(pick['audio'])
                             curr_samples += seg_len
                         attempts += 1
@@ -774,10 +960,17 @@ if active_decks:
                     out = export_audio(final_y, ref_sr)
                     durata_effettiva = final_y.shape[1] / ref_sr
 
+                    # Salvati per l'eventuale export MIDI della struttura (vedi sezione risultato).
+                    st.session_state.mix_events = dj_events
+                    st.session_state.mix_events_sr = ref_sr
+                    st.session_state.mix_events_tempo = (
+                        dj_leader_d['tempo'] if apply_dj_remix and dj_leader_d['tempo'] > 0 else 120.0
+                    )
+
                     # --- PRESET RIPRODUCIBILE (seed + parametri) ---
                     preset = {
                         "loop507_hyper_mixer_preset": True,
-                        "versione_app": "5.0",
+                        "versione_app": "5.1",
                         "seed": seed_used,
                         "modalita_taglio": tipo_taglio,
                         "parametro_taglio": taglio_meta,
@@ -786,6 +979,8 @@ if active_decks:
                             "leader": dj_leader_key,
                             "overlay_gain": overlay_gain,
                             "num_eventi": num_overlay_events,
+                            "bpm_align": dj_bpm_align,
+                            "beatmatch": dj_beatmatch,
                         } if apply_dj_remix else None,
                         "crossfade_ms": crossfade_ms if (apply_crossfade and not apply_dj_remix) else 0,
                         "pesi_deck": deck_weights,
@@ -805,10 +1000,15 @@ if active_decks:
                     # --- GENERAZIONE REPORT BRANDIZZATO BILINGUE ---
                     ts_audio = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     if apply_dj_remix:
-                        processo_it = f"DJ Remix: Deck {dj_leader_key.upper()} intatto come base / {eventi_piazzati} overlay sparsi (seed {seed_used}) / Cross-Deck Fragmentation / Stereo Preservato"
-                        processo_en = f"DJ Remix: Deck {dj_leader_key.upper()} kept intact as base / {eventi_piazzati} scattered overlays (seed {seed_used}) / Cross-Deck Fragmentation / Stereo Preserved"
-                        extra_it = f"* Deck Base (intatto): {dj_leader_key.upper()}\n* Overlay Piazzati: {eventi_piazzati} (volume {overlay_gain:.2f}x)"
-                        extra_en = f"* Base Deck (intact): {dj_leader_key.upper()}\n* Overlays Placed: {eventi_piazzati} (gain {overlay_gain:.2f}x)"
+                        allineamento_info = ""
+                        if dj_bpm_align:
+                            n_align = len(decks_allineati)
+                            allineamento_info = f" / BPM allineato su {n_align} follower" if n_align else " / nessun follower necessitava allineamento"
+                        beatmatch_info = " / Beatmatching attivo (picchi agganciati)" if dj_beatmatch else " / Beatmatching disattivato (piazzamento casuale)"
+                        processo_it = f"DJ Remix: Deck {dj_leader_key.upper()} intatto come base / {eventi_piazzati} overlay sparsi (seed {seed_used}){allineamento_info}{beatmatch_info} / Stereo Preservato"
+                        processo_en = f"DJ Remix: Deck {dj_leader_key.upper()} kept intact as base / {eventi_piazzati} scattered overlays (seed {seed_used}) / Stereo Preserved"
+                        extra_it = f"* Deck Base (intatto): {dj_leader_key.upper()}\n* Overlay Piazzati: {eventi_piazzati} (volume {overlay_gain:.2f}x)\n* Allineamento BPM: {'attivo' if dj_bpm_align else 'disattivo'}\n* Beatmatching: {'attivo' if dj_beatmatch else 'disattivo'}"
+                        extra_en = f"* Base Deck (intact): {dj_leader_key.upper()}\n* Overlays Placed: {eventi_piazzati} (gain {overlay_gain:.2f}x)\n* BPM Alignment: {'on' if dj_bpm_align else 'off'}\n* Beatmatching: {'on' if dj_beatmatch else 'off'}"
                     else:
                         processo_it = f"Shuffling Ricorsivo (seed {seed_used}) / Cross-Deck Fragmentation / Sample Rate Uniformato / Stereo Preservato / Pesi Deck Personalizzati"
                         processo_en = f"Recursive Shuffling (seed {seed_used}) / Cross-Deck Fragmentation / Uniform Sample Rate / Stereo Preserved / Custom Deck Weights"
@@ -817,7 +1017,7 @@ if active_decks:
 
                     st.session_state.audio_report = f"""
 ╔════════════════════════════════════════════════════════════════╗
-  HYPER-MIXER v5.0 - AUDIO RECONSTRUCTION LOG (STEREO + DJ REMIX)
+  HYPER-MIXER v5.1 - AUDIO RECONSTRUCTION LOG (STEREO + DJ REMIX + MIDI)
   Generated on: {ts_audio}
 ╚════════════════════════════════════════════════════════════════╝
 
@@ -825,7 +1025,7 @@ if active_decks:
 
 ═══════════════════ ITALIANO ═══════════════════
 
-:: ENGINE: hyper_mixer_loop507 [v5.0]
+:: ENGINE: hyper_mixer_loop507 [v5.1]
 :: ANALISI: Beat Tracking (Librosa) / RMS Envelope / Onset Detection
 :: STILE: Audio-Glitch / Granular Synthesis
 :: PROCESSO: {processo_it}
@@ -843,7 +1043,7 @@ if active_decks:
 
 ═══════════════════ ENGLISH ═══════════════════
 
-:: ENGINE: hyper_mixer_loop507 [v5.0]
+:: ENGINE: hyper_mixer_loop507 [v5.1]
 :: ANALYSIS: Beat Tracking (Librosa) / RMS Envelope / Onset Detection
 :: STYLE: Audio-Glitch / Granular Synthesis
 :: PROCESS: {processo_en}
@@ -870,7 +1070,7 @@ if st.session_state.get('mix_ready'):
     st.divider()
     st.subheader("🎵 Risultato del Mix")
     st.audio(st.session_state.mix_ready)
-    col_d1, col_d2, col_d3 = st.columns(3)
+    col_d1, col_d2, col_d3, col_d4 = st.columns(4)
     with col_d1:
         st.download_button("📥 Scarica Mix MP3", st.session_state.mix_ready, "loop507_custom_mix.mp3", use_container_width=True)
     with col_d2:
@@ -881,6 +1081,24 @@ if st.session_state.get('mix_ready'):
             "loop507_preset.json", use_container_width=True,
             help="Contiene il seed e i parametri usati: ricaricalo per riprovare a ritrovare questo mix."
         )
+    with col_d4:
+        if MIDI_DISPONIBILE:
+            midi_buffer = build_structure_midi(
+                st.session_state.get('mix_events', []),
+                st.session_state.get('mix_events_sr', TARGET_SR),
+                st.session_state.get('mix_events_tempo', 120.0),
+            )
+            if midi_buffer:
+                st.download_button(
+                    "🎹 Scarica Struttura MIDI", midi_buffer, "loop507_struttura.mid",
+                    use_container_width=True,
+                    help="Ogni taglio/overlay diventa una nota (l'altezza varia per deck: A=36, B=37, ...). "
+                         "Utile per importare la struttura ritmica del mix in un DAW."
+                )
+            else:
+                st.caption("🎹 Nessuna struttura MIDI disponibile per questo mix.")
+        else:
+            st.caption("🎹 Export MIDI non disponibile: aggiungi 'mido' a requirements.txt.")
 
 st.markdown("---")
-st.caption("Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva | Stereo + DJ Remix v5.0")
+st.caption("Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva | Stereo + DJ Remix + MIDI v5.1")
