@@ -169,8 +169,12 @@ def apply_bass_cut(seg, sr, cutoff_hz=150, order=4):
     """Filtro passa-alto (Butterworth, zero-phase con sosfiltfilt per non introdurre click)
     applicato a un frammento overlay: gli toglie le frequenze basse, cosi' non litiga con la
     linea di basso del leader che resta intatta sotto. È la versione 'leggera' del classico
-    EQ bass-swap che fanno i DJ col mixer hardware."""
-    if not SCIPY_DISPONIBILE or seg.shape[1] < order * 3:
+    EQ bass-swap che fanno i DJ col mixer hardware.
+    NOTA: sosfiltfilt richiede internamente un padlen (~3x la lunghezza del filtro) più alto
+    di quanto sembri a prima vista con un semplice order*3; la soglia qui sotto è tarata per
+    stare sopra quel limite reale (verificato: order=4 richiede padlen=15), col try/except
+    comunque a fare da rete di sicurezza per qualunque altro edge case."""
+    if not SCIPY_DISPONIBILE or seg.shape[1] < max(30, order * 6):
         return seg
     try:
         sos = butter(order, cutoff_hz, btype='highpass', fs=sr, output='sos')
@@ -368,12 +372,23 @@ def export_audio(y, sr):
 def time_stretch_stereo(y, rate):
     """Cambia davvero la velocità dell'audio (non solo la lunghezza dei tagli), preservando
     l'intonazione (phase vocoder via librosa.effects.time_stretch). rate > 1 = più veloce,
-    rate < 1 = più lento. Applicato canale per canale per non mescolare L/R."""
+    rate < 1 = più lento. Applicato canale per canale per non mescolare L/R.
+    Su frammenti molto corti (es. quelli usati per l'allineamento BPM in DJ Remix, che
+    possono scendere sotto i 300 campioni) l'n_fft di default (2048) è più largo del
+    segmento stesso: librosa non si rompe, ma la risoluzione della STFT degrada visibilmente
+    (fix qualità: n_fft adattivo, mai più grande del segmento)."""
     if rate is None or rate <= 0 or abs(rate - 1.0) < 1e-3:
         return y  # nulla da fare, o rate non valido: restituisco l'audio invariato
+    seg_len = y.shape[1]
+    n_fft = 2048
+    if seg_len < n_fft:
+        n_fft = max(32, 2 ** int(np.floor(np.log2(max(seg_len, 1)))))
+    hop_length = max(1, n_fft // 4)
     stretched_channels = []
     for ch in range(y.shape[0]):
-        stretched_channels.append(librosa.effects.time_stretch(y[ch], rate=rate))
+        stretched_channels.append(
+            librosa.effects.time_stretch(y[ch], rate=rate, n_fft=n_fft, hop_length=hop_length)
+        )
     # Il phase vocoder puo' produrre canali di lunghezza leggermente diversa per arrotondamenti:
     # uniformo al più corto per poter poi fare np.stack senza errori di shape.
     min_len = min(ch.shape[0] for ch in stretched_channels)
@@ -1080,7 +1095,15 @@ if active_decks:
                                 leader_nome, leader_camelot, leader_conf = detect_key_camelot(dj_leader_d['y'], ref_sr)
                                 follower_decks_coinvolti = sorted({s['deck'] for s in overlay_pool_raw})
                                 for fk in follower_decks_coinvolti:
-                                    f_nome, f_camelot, f_conf = detect_key_camelot(active_decks[fk]['y'], active_decks[fk]['sr'])
+                                    # NON uso active_decks[fk]: un deck può aver contribuito segmenti
+                                    # al pool e poi essere stato "liberato" dalla RAM (bottone Libera
+                                    # RAM) — in quel caso non è più in active_decks e l'indicizzazione
+                                    # diretta andrebbe in KeyError. Controllo esplicitamente.
+                                    fdeck = st.session_state.decks.get(fk)
+                                    if not fdeck or fdeck.get('y') is None:
+                                        camelot_info.append((fk, "RAM liberata", "?", None))
+                                        continue
+                                    f_nome, f_camelot, f_conf = detect_key_camelot(fdeck['y'], fdeck['sr'])
                                     compat = camelot_compatibility(leader_camelot, f_camelot)
                                     camelot_info.append((fk, f_nome, f_camelot, compat))
                             if leader_camelot:
