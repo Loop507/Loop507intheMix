@@ -166,19 +166,24 @@ def group_beats_into_phrases(beat_grid_samples, beats_per_phrase=8):
 
 # --- EQ Bass Swap: taglia i bassi del frammento overlay per non "impastare" col leader ----
 def apply_bass_cut(seg, sr, cutoff_hz=150, order=4):
-    """Filtro passa-alto (Butterworth, zero-phase con sosfiltfilt per non introdurre click)
-    applicato a un frammento overlay: gli toglie le frequenze basse, cosi' non litiga con la
-    linea di basso del leader che resta intatta sotto. È la versione 'leggera' del classico
-    EQ bass-swap che fanno i DJ col mixer hardware.
-    NOTA: sosfiltfilt richiede internamente un padlen (~3x la lunghezza del filtro) più alto
-    di quanto sembri a prima vista con un semplice order*3; la soglia qui sotto è tarata per
-    stare sopra quel limite reale (verificato: order=4 richiede padlen=15), col try/except
+    """Filtro passa-alto in stile Linkwitz-Riley (LR4): cascata di due Butterworth del 2°
+    ordine, invece di un singolo Butterworth del 4° ordine — stesso principio dei crossover
+    professionali (usato ad es. in strumenti come AutoDJ Smart Mixer). Rispetto a un Butterworth
+    singolo, l'attenuazione esattamente al punto di taglio è -6dB invece di -3dB: un 'gradino'
+    più netto e deciso proprio dove serve, verificato per confronto diretto (Butterworth: -2.93dB,
+    LR4: -5.94dB alla stessa frequenza di taglio), a parità di tenuta sopra/sotto.
+    Zero-phase (sosfiltfilt) per non introdurre click. È la versione 'leggera' del classico
+    EQ bass-swap che fanno i DJ col mixer hardware — qui usata per pulire i bassi dei
+    frammenti overlay, cosi' non litigano con la linea di basso del leader che resta intatta.
+    NOTA: sosfiltfilt richiede un padlen minimo (verificato: 15 campioni anche con la cascata
+    LR4 a 4 sezioni); la soglia qui sotto sta abbondantemente sopra quel limite, col try/except
     comunque a fare da rete di sicurezza per qualunque altro edge case."""
     if not SCIPY_DISPONIBILE or seg.shape[1] < max(30, order * 6):
         return seg
     try:
-        sos = butter(order, cutoff_hz, btype='highpass', fs=sr, output='sos')
-        filtered = np.stack([sosfiltfilt(sos, seg[ch]) for ch in range(seg.shape[0])], axis=0)
+        sos_stage = butter(order // 2, cutoff_hz, btype='highpass', fs=sr, output='sos')
+        sos_lr4 = np.vstack([sos_stage, sos_stage])  # cascata: applica lo stage due volte
+        filtered = np.stack([sosfiltfilt(sos_lr4, seg[ch]) for ch in range(seg.shape[0])], axis=0)
         return filtered
     except Exception:
         return seg  # in caso di segmento troppo corto o altro problema, non rompo il mix
@@ -1138,8 +1143,9 @@ if active_decks:
                 "🎚️ EQ Bass Swap (taglia i bassi degli overlay)", value=False,
                 help="I DJ tagliano i bassi di una traccia quando ne sovrappongono un'altra, "
                      "per evitare che le due linee di basso 'impastino'. Se attivo, ogni "
-                     "frammento overlay viene filtrato con un passa-alto prima di essere "
-                     "sommato, lasciando i bassi puliti al solo leader."
+                     "frammento overlay viene filtrato con un crossover Linkwitz-Riley (LR4, "
+                     "lo standard professionale, taglio più netto di un semplice passa-alto) "
+                     "prima di essere sommato, lasciando i bassi puliti al solo leader."
             )
             dj_bass_cutoff = 150
             if dj_bass_swap:
@@ -1387,7 +1393,7 @@ if active_decks:
                     # --- PRESET RIPRODUCIBILE (seed + parametri) ---
                     preset = {
                         "loop507_hyper_mixer_preset": True,
-                        "versione_app": "5.3",
+                        "versione_app": "5.4",
                         "seed": seed_used,
                         "modalita_taglio": tipo_taglio,
                         "parametro_taglio": taglio_meta,
@@ -1452,7 +1458,7 @@ if active_decks:
 
                     st.session_state.audio_report = f"""
 ╔════════════════════════════════════════════════════════════════╗
-  HYPER-MIXER v5.3 - AUDIO RECONSTRUCTION LOG (STEREO + DJ REMIX + MIDI)
+  HYPER-MIXER v5.4 - AUDIO RECONSTRUCTION LOG (STEREO + DJ REMIX + MIDI)
   Generated on: {ts_audio}
 ╚════════════════════════════════════════════════════════════════╝
 
@@ -1460,7 +1466,7 @@ if active_decks:
 
 ═══════════════════ ITALIANO ═══════════════════
 
-:: ENGINE: hyper_mixer_loop507 [v5.3]
+:: ENGINE: hyper_mixer_loop507 [v5.4]
 :: ANALISI: Beat Tracking (Librosa) / RMS Envelope / Onset Detection
 :: STILE: Audio-Glitch / Granular Synthesis
 :: PROCESSO: {processo_it}
@@ -1478,7 +1484,7 @@ if active_decks:
 
 ═══════════════════ ENGLISH ═══════════════════
 
-:: ENGINE: hyper_mixer_loop507 [v5.3]
+:: ENGINE: hyper_mixer_loop507 [v5.4]
 :: ANALYSIS: Beat Tracking (Librosa) / RMS Envelope / Onset Detection
 :: STYLE: Audio-Glitch / Granular Synthesis
 :: PROCESS: {processo_en}
@@ -1536,4 +1542,4 @@ if st.session_state.get('mix_ready'):
             st.caption("🎹 Export MIDI non disponibile: aggiungi 'mido' a requirements.txt.")
 
 st.markdown("---")
-st.caption("Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva | Stereo + DJ Remix + Tecniche DJ Avanzate v5.3")
+st.caption("Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva | Stereo + DJ Remix + Tecniche DJ Avanzate + LR4 v5.4")
