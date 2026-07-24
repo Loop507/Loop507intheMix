@@ -184,6 +184,73 @@ def apply_bass_cut(seg, sr, cutoff_hz=150, order=4):
         return seg  # in caso di segmento troppo corto o altro problema, non rompo il mix
 
 
+# --- Tecniche leggere ispirate alle console DJ top di gamma (Opus Quad e simili) ----------
+def apply_hpss_isolation(seg, sr, mode="percussive"):
+    """Separazione armonica/percussiva (HPSS): la versione 'leggera' della Track Separation
+    delle console top (niente modelli ML pesanti, solo matematica via librosa — stessa
+    tecnica già usata in VIDEODECOMPOSER per isolare melodia/voce). mode='percussive' isola
+    batteria/transienti, mode='harmonic' isola basso/melodia. Richiede un frammento con
+    abbastanza campioni per una STFT sensata: sotto soglia, o in caso di qualunque problema,
+    restituisce il frammento originale invariato invece di rischiare un crash."""
+    if seg.shape[1] < 2048:
+        return seg
+    try:
+        out_channels = []
+        for ch in range(seg.shape[0]):
+            harmonic, percussive = librosa.effects.hpss(seg[ch])
+            out_channels.append(percussive if mode == "percussive" else harmonic)
+        return np.stack(out_channels, axis=0)
+    except Exception:
+        return seg
+
+
+def reverse_segment(seg):
+    """'Backspin' semplificato: inverte il frammento nel tempo. Operazione puramente
+    numerica (nessuna libreria esterna coinvolta), quindi non può fallire in pratica —
+    il try/except resta comunque per uniformità con le altre funzioni FX."""
+    try:
+        return np.ascontiguousarray(seg[:, ::-1])
+    except Exception:
+        return seg
+
+
+def build_loop_roll_segment(seg, repeats, max_total_samples=None):
+    """'Loop Roll' in stile console DJ: ripete un microframmento più volte di seguito,
+    creando lo stutter tipico di questi controlli. Se il risultato sarebbe più lungo di
+    max_total_samples (es. il buffer disponibile), riduce automaticamente le ripetizioni
+    invece di generare qualcosa che non potrà mai essere piazzato."""
+    if seg.shape[1] <= 0 or repeats <= 1:
+        return seg
+    try:
+        if max_total_samples:
+            repeats = max(1, min(repeats, max_total_samples // max(1, seg.shape[1])))
+        return np.tile(seg, (1, repeats))
+    except Exception:
+        return seg
+
+
+def apply_echo_fx(seg, sr, delay_ms=125, feedback=0.35, num_repeats=3, mix=0.5):
+    """Digital delay/echo semplice, stile 'Beat FX' dei mixer da DJ: somma copie ritardate
+    e via via più attenuate del frammento a sé stesso (feedback < 1, quindi decade sempre,
+    mai un loop che si autoalimenta all'infinito). Il buffer risultante è più lungo
+    dell'originale per ospitare le code dell'eco."""
+    if seg.shape[1] <= 0 or num_repeats <= 0:
+        return seg
+    try:
+        delay_samples = max(1, int(sr * delay_ms / 1000))
+        total_len = seg.shape[1] + delay_samples * num_repeats
+        out = np.zeros((seg.shape[0], total_len), dtype=np.float64)
+        out[:, :seg.shape[1]] += seg
+        gain = feedback
+        for i in range(1, num_repeats + 1):
+            start = delay_samples * i
+            out[:, start:start + seg.shape[1]] += seg * gain * mix
+            gain *= feedback
+        return out
+    except Exception:
+        return seg
+
+
 @st.cache_data
 def analyze_track(audio_file_object):
     """Analizza un file audio: carica in stereo, converte in WAV temporaneo, rileva tempo.
@@ -444,7 +511,8 @@ def find_strongest_onset_offset(seg, sr):
 
 def build_dj_remix_overlay(leader_y, leader_sr, overlay_segments, overlay_gain, num_events,
                             rng, deck_weights=None, beatmatch=True, phrase_beats=None,
-                            bass_cutoff_hz=None):
+                            bass_cutoff_hz=None, hpss_mode=None, reverse_probability=0.0,
+                            loop_roll_probability=0.0, loop_roll_repeats=4, echo_probability=0.0):
     """Costruisce un mix 'letto + overlay': leader_y resta INTATTO come base (nessun taglio),
     e sopra vengono sparsi num_events frammenti presi da overlay_segments, sommati (non
     concatenati), moltiplicati per overlay_gain.
@@ -456,6 +524,17 @@ def build_dj_remix_overlay(leader_y, leader_sr, overlay_segments, overlay_gain, 
     strutturale, non solo ritmico.
     Se bass_cutoff_hz e' impostato: ogni frammento overlay viene filtrato passa-alto prima di
     essere sommato, per non 'impastare' con la linea di basso del leader (EQ bass swap).
+    hpss_mode ('percussive'/'harmonic'/None): isola solo la componente percussiva o armonica
+    del frammento prima di sommarlo (stem separation 'leggera', precalcolata una sola volta
+    per frammento — vedi hpss_cache sotto — per non rifare un'operazione costosa ad ogni
+    piazzamento se lo stesso frammento viene ripescato più volte).
+    reverse_probability / loop_roll_probability / echo_probability: probabilità indipendenti
+    (0-1) che, ad ogni piazzamento, il frammento venga invertito (backspin), trasformato in
+    stutter (loop roll), o passato attraverso un eco (Beat FX). Ognuno di questi FX può
+    cambiare la lunghezza del frammento: per questo, DOPO averli applicati, la lunghezza
+    viene sempre ricontrollata contro lo spazio disponibile nel buffer — se non ci sta più,
+    l'evento viene semplicemente scartato (si ripesca al tentativo successivo) invece di
+    troncare bruscamente o sforare i limiti del buffer.
     Ritorna anche la lista degli eventi piazzati (per l'export MIDI della struttura)."""
     buffer = leader_y.astype(np.float64).copy()
     total = buffer.shape[1]
@@ -477,6 +556,7 @@ def build_dj_remix_overlay(leader_y, leader_sr, overlay_segments, overlay_gain, 
             counts[s['deck']] = counts.get(s['deck'], 0) + 1
         weights_list = [deck_weights.get(s['deck'], 5) / max(1, counts.get(s['deck'], 1)) for s in overlay_segments]
 
+    hpss_cache = {}  # id(pick) -> audio isolato, per non ricalcolare l'HPSS ad ogni ripescata
     placed = 0
     attempts = 0
     max_attempts = max(500, num_events * 20)  # guardia anti-loop-infinito, stessa logica del bug #2
@@ -485,20 +565,48 @@ def build_dj_remix_overlay(leader_y, leader_sr, overlay_segments, overlay_gain, 
         attempts += 1
         pick = rng.choices(overlay_segments, weights=weights_list, k=1)[0] if weights_list else rng.choice(overlay_segments)
         seg = pick['audio']
-        seg_len = seg.shape[1]
-        if seg_len <= 0 or seg_len > total:
+        if seg.shape[1] <= 0:
             continue
+
+        if hpss_mode:
+            cache_key = id(pick)
+            if cache_key not in hpss_cache:
+                hpss_cache[cache_key] = apply_hpss_isolation(seg, leader_sr, mode=hpss_mode)
+            seg = hpss_cache[cache_key]
         if bass_cutoff_hz:
             # EQ Bass Swap: tolgo i bassi dall'overlay PRIMA di sommarlo, non dopo — cosi'
             # il leader sotto resta con la sua linea di basso intatta e pulita.
             seg = apply_bass_cut(seg, leader_sr, cutoff_hz=bass_cutoff_hz)
 
+        # FX stocastici indipendenti: ognuno può cambiare la lunghezza del frammento,
+        # quindi invalidano l'onset_offset precalcolato (lo ricalcoliamo sotto se serve).
+        lunghezza_alterata = False
+        if reverse_probability and rng.random() < reverse_probability:
+            seg = reverse_segment(seg)
+            lunghezza_alterata = True  # la posizione dell'attacco cambia anche se la lunghezza no
+        if loop_roll_probability and rng.random() < loop_roll_probability:
+            roll_piece_len = max(1, seg.shape[1] // 4)
+            seg = build_loop_roll_segment(seg[:, :roll_piece_len], loop_roll_repeats, max_total_samples=total)
+            lunghezza_alterata = True
+        if echo_probability and rng.random() < echo_probability:
+            seg = apply_echo_fx(seg, leader_sr)
+            lunghezza_alterata = True
+
+        seg_len = seg.shape[1]
+        if seg_len <= 0 or seg_len > total:
+            continue  # un fx ha reso il frammento troppo lungo/corto: salto, non rompo nulla
+
         if beatmatch:
             beat_pos = rng.choice(beat_grid)
-            # onset_offset e' pre-calcolato su ogni segmento (vedi sotto) per non rifare
-            # la detection ad ogni singolo piazzamento, anche se lo stesso frammento
-            # viene ripescato più volte.
-            onset_offset = pick.get('onset_offset', 0)
+            if lunghezza_alterata:
+                # il precalcolato non è più valido (segmento invertito/allungato/ripetuto):
+                # ricalcolo l'attacco più forte sul frammento cosi' com'è ora.
+                onset_offset = find_strongest_onset_offset(seg, leader_sr)
+            else:
+                # onset_offset e' pre-calcolato su ogni segmento (vedi sotto) per non rifare
+                # la detection ad ogni singolo piazzamento, anche se lo stesso frammento
+                # viene ripescato più volte.
+                onset_offset = pick.get('onset_offset', 0)
             start = beat_pos - onset_offset
             if start < 0:
                 start = 0
@@ -972,6 +1080,11 @@ if active_decks:
         dj_key_check = False
         dj_bass_swap = False
         dj_bass_cutoff = 150
+        dj_hpss_mode = None
+        dj_reverse_prob = 0.0
+        dj_loop_roll_prob = 0.0
+        dj_loop_roll_repeats = 4
+        dj_echo_prob = 0.0
         if apply_dj_remix:
             dj_leader_key = st.sidebar.selectbox(
                 "Deck da tenere intatto (base):",
@@ -1034,6 +1147,46 @@ if active_decks:
                     "Frequenza di taglio (Hz):", 60, 400, 150, step=10,
                     help="Sotto questa frequenza, i bassi dell'overlay vengono rimossi."
                 )
+
+            dj_hpss_label = st.sidebar.selectbox(
+                "🥁 Isolamento HPSS overlay (stem separation 'leggera')", 
+                ["Disattivato", "Solo percussivo (batteria)", "Solo armonico (melodia/basso)"],
+                index=0,
+                help="Come la Track Separation delle console top (Opus Quad, DDJ-FLX10...), "
+                     "ma con matematica pura invece di modelli ML pesanti (stessa tecnica "
+                     "HPSS che usi in VIDEODECOMPOSER). Isola solo batteria o solo melodia "
+                     "da ogni frammento overlay prima di sommarlo."
+            )
+            dj_hpss_mode = {"Disattivato": None, "Solo percussivo (batteria)": "percussive",
+                             "Solo armonico (melodia/basso)": "harmonic"}[dj_hpss_label]
+
+            dj_reverse_fx = st.sidebar.checkbox(
+                "↩️ Backspin casuale su alcuni overlay", value=False,
+                help="Come il 'risucchio' che senti quando un DJ tocca il jogwheel all'indietro: "
+                     "alcuni frammenti overlay vengono invertiti nel tempo prima di essere piazzati."
+            )
+            dj_reverse_prob = st.sidebar.slider(
+                "Probabilità backspin:", 0.0, 1.0, 0.15, step=0.05
+            ) if dj_reverse_fx else 0.0
+
+            dj_loop_roll_fx = st.sidebar.checkbox(
+                "🔁 Loop Roll (stutter) su alcuni overlay", value=False,
+                help="Come il pulsante Loop Roll delle console: un microframmento si ripete "
+                     "a raffica invece di suonare una volta sola."
+            )
+            dj_loop_roll_prob, dj_loop_roll_repeats = 0.0, 4
+            if dj_loop_roll_fx:
+                dj_loop_roll_prob = st.sidebar.slider("Probabilità loop roll:", 0.0, 1.0, 0.15, step=0.05)
+                dj_loop_roll_repeats = st.sidebar.slider("Ripetizioni:", 2, 8, 4)
+
+            dj_echo_fx = st.sidebar.checkbox(
+                "🔊 Beat FX Echo su alcuni overlay", value=False,
+                help="Come il tasto Echo dei mixer da DJ: alcuni frammenti overlay vengono "
+                     "sommati a copie ritardate e attenuate di sé stessi."
+            )
+            dj_echo_prob = st.sidebar.slider(
+                "Probabilità echo:", 0.0, 1.0, 0.15, step=0.05
+            ) if dj_echo_fx else 0.0
 
             st.sidebar.caption(
                 f"I frammenti verranno presi da tutti i deck TRANNE {dj_leader_key.upper() if dj_leader_key else '—'} "
@@ -1145,6 +1298,11 @@ if active_decks:
                                 rng, deck_weights, beatmatch=dj_beatmatch,
                                 phrase_beats=dj_beats_per_phrase if dj_phrase_match else None,
                                 bass_cutoff_hz=dj_bass_cutoff if dj_bass_swap else None,
+                                hpss_mode=dj_hpss_mode,
+                                reverse_probability=dj_reverse_prob,
+                                loop_roll_probability=dj_loop_roll_prob,
+                                loop_roll_repeats=dj_loop_roll_repeats,
+                                echo_probability=dj_echo_prob,
                             )
                         chosen = [True]  # solo per riusare il check "if not chosen" sotto
 
