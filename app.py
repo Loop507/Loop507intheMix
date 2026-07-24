@@ -11,6 +11,14 @@ import json
 from datetime import datetime
 
 try:
+    from scipy.signal import butter, sosfiltfilt
+    SCIPY_DISPONIBILE = True
+except ImportError:
+    # scipy e' quasi sempre installato insieme a librosa, ma per sicurezza l'EQ Bass Swap
+    # si disattiva da sola invece di far crashare tutta l'app se manca.
+    SCIPY_DISPONIBILE = False
+
+try:
     import mido
     MIDI_DISPONIBILE = True
 except ImportError:
@@ -71,6 +79,105 @@ def correggi_errore_ottava(tempo_val, bpm_min, bpm_max):
         t *= 2
         guard += 1
     return t
+
+
+# --- Rilevamento tonalità (Krumhansl-Schmuckler) + notazione Camelot ---------------------
+# Profili statistici standard: quanto ogni grado della scala cromatica "suona stabile"
+# in un contesto maggiore/minore (Krumhansl & Kessler, 1982). Sono la base di praticamente
+# ogni key-detector open source basato su librosa (music-key-finder, pyKeyFinder, ecc.).
+_KS_MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+_KS_MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+_PITCH_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+# Notazione Camelot: numero+lettera per ogni tonalità maggiore (B) e minore (A).
+# Le tonalità "compatibili" sono: stesso numero, ±1, o stessa cifra A<->B (relativa magg/min).
+_CAMELOT_MAJOR = {'B': '1B', 'F#': '2B', 'Db': '3B', 'Ab': '4B', 'Eb': '5B', 'Bb': '6B',
+                  'F': '7B', 'C': '8B', 'G': '9B', 'D': '10B', 'A': '11B', 'E': '12B'}
+_CAMELOT_MINOR = {'Ab': '1A', 'Eb': '2A', 'Bb': '3A', 'F': '4A', 'C': '5A', 'G': '6A',
+                  'D': '7A', 'A': '8A', 'E': '9A', 'B': '10A', 'F#': '11A', 'Db': '12A'}
+_ENHARMONIC = {'C#': 'Db', 'D#': 'Eb', 'G#': 'Ab', 'A#': 'Bb'}  # per pescare dalle tabelle sopra
+
+
+def detect_key_camelot(y, sr):
+    """Rileva la tonalità (es. 'A minor') e il codice Camelot corrispondente (es. '8A'),
+    usando le chroma features di librosa correlate ai profili Krumhansl-Schmuckler. Stessa
+    tecnica di pyKeyFinder/music-key-finder: nessuna libreria nuova, solo librosa+numpy che
+    abbiamo già. Ritorna (nome_tonalita, codice_camelot, confidenza) — confidenza bassa
+    (< ~0.15 di scarto tra 1° e 2° risultato) segnala un brano tonalmente ambiguo."""
+    y_mono = np.mean(y, axis=0)
+    try:
+        chroma = librosa.feature.chroma_cqt(y=y_mono, sr=sr)
+    except Exception:
+        return None, None, 0.0
+    mean_chroma = np.mean(chroma, axis=1)
+    if np.sum(mean_chroma) <= 0:
+        return None, None, 0.0
+
+    scores = []
+    for shift in range(12):
+        major_profile = np.roll(_KS_MAJOR_PROFILE, shift)
+        minor_profile = np.roll(_KS_MINOR_PROFILE, shift)
+        corr_major = np.corrcoef(mean_chroma, major_profile)[0, 1]
+        corr_minor = np.corrcoef(mean_chroma, minor_profile)[0, 1]
+        scores.append((corr_major, _PITCH_NAMES[shift], 'major'))
+        scores.append((corr_minor, _PITCH_NAMES[shift], 'minor'))
+
+    scores.sort(key=lambda s: (s[0] if not np.isnan(s[0]) else -1), reverse=True)
+    best_score, best_pitch, best_mode = scores[0]
+    second_score = scores[1][0]
+    confidenza = float(best_score - second_score) if not np.isnan(best_score) else 0.0
+
+    nome_tonalita = f"{best_pitch} {'maggiore' if best_mode == 'major' else 'minore'}"
+    lookup_pitch = _ENHARMONIC.get(best_pitch, best_pitch)
+    tabella = _CAMELOT_MAJOR if best_mode == 'major' else _CAMELOT_MINOR
+    camelot = tabella.get(lookup_pitch, '?')
+    return nome_tonalita, camelot, confidenza
+
+
+def camelot_compatibility(camelot_a, camelot_b):
+    """Confronta due codici Camelot (es. '8A' e '9A') e dice se sono in relazione armonica
+    compatibile secondo le regole standard: stesso numero, ±1, o stesso numero A<->B."""
+    if not camelot_a or not camelot_b or camelot_a == '?' or camelot_b == '?':
+        return None  # tonalità non rilevabile, non possiamo dire nulla
+    try:
+        num_a, letter_a = int(camelot_a[:-1]), camelot_a[-1]
+        num_b, letter_b = int(camelot_b[:-1]), camelot_b[-1]
+    except (ValueError, IndexError):
+        return None
+    if camelot_a == camelot_b:
+        return "identica"
+    if letter_a == letter_b and (abs(num_a - num_b) == 1 or abs(num_a - num_b) == 11):
+        return "adiacente"
+    if num_a == num_b and letter_a != letter_b:
+        return "relativa"
+    return "dissonante"
+
+
+# --- Aggancio a frasi musicali (8/16 battute), non solo al singolo beat -------------------
+def group_beats_into_phrases(beat_grid_samples, beats_per_phrase=8):
+    """I DJ non allineano solo i beat, allineano le FRASI (blocchi di 8/16 battute: intro,
+    verse, drop...). Raggruppiamo la griglia beat già rilevata in blocchi di N beat e
+    restituiamo solo l'inizio di ogni blocco: sono i punti 'strutturalmente giusti' dove
+    piazzare un overlay, non un beat qualsiasi in mezzo a una frase."""
+    if not beat_grid_samples or beats_per_phrase <= 0:
+        return beat_grid_samples
+    return beat_grid_samples[::beats_per_phrase]
+
+
+# --- EQ Bass Swap: taglia i bassi del frammento overlay per non "impastare" col leader ----
+def apply_bass_cut(seg, sr, cutoff_hz=150, order=4):
+    """Filtro passa-alto (Butterworth, zero-phase con sosfiltfilt per non introdurre click)
+    applicato a un frammento overlay: gli toglie le frequenze basse, cosi' non litiga con la
+    linea di basso del leader che resta intatta sotto. È la versione 'leggera' del classico
+    EQ bass-swap che fanno i DJ col mixer hardware."""
+    if not SCIPY_DISPONIBILE or seg.shape[1] < order * 3:
+        return seg
+    try:
+        sos = butter(order, cutoff_hz, btype='highpass', fs=sr, output='sos')
+        filtered = np.stack([sosfiltfilt(sos, seg[ch]) for ch in range(seg.shape[0])], axis=0)
+        return filtered
+    except Exception:
+        return seg  # in caso di segmento troppo corto o altro problema, non rompo il mix
 
 
 @st.cache_data
@@ -321,13 +428,19 @@ def find_strongest_onset_offset(seg, sr):
 
 
 def build_dj_remix_overlay(leader_y, leader_sr, overlay_segments, overlay_gain, num_events,
-                            rng, deck_weights=None, beatmatch=True):
+                            rng, deck_weights=None, beatmatch=True, phrase_beats=None,
+                            bass_cutoff_hz=None):
     """Costruisce un mix 'letto + overlay': leader_y resta INTATTO come base (nessun taglio),
     e sopra vengono sparsi num_events frammenti presi da overlay_segments, sommati (non
     concatenati), moltiplicati per overlay_gain.
     Se beatmatch e' attivo: ogni frammento non va a un punto casuale qualsiasi, ma il suo
     attacco più forte viene agganciato esattamente a un beat della griglia del leader —
     il vero 'aggancio ai picchi' stile DJ, non solo lo stesso tempo.
+    Se phrase_beats e' impostato (richiede beatmatch): invece di agganciare a QUALSIASI beat,
+    aggancia solo all'inizio di una frase (blocco di phrase_beats battute) — allineamento
+    strutturale, non solo ritmico.
+    Se bass_cutoff_hz e' impostato: ogni frammento overlay viene filtrato passa-alto prima di
+    essere sommato, per non 'impastare' con la linea di basso del leader (EQ bass swap).
     Ritorna anche la lista degli eventi piazzati (per l'export MIDI della struttura)."""
     buffer = leader_y.astype(np.float64).copy()
     total = buffer.shape[1]
@@ -337,6 +450,10 @@ def build_dj_remix_overlay(leader_y, leader_sr, overlay_segments, overlay_gain, 
     beat_grid = get_beat_grid_samples(leader_y, leader_sr) if beatmatch else []
     if beatmatch and not beat_grid:
         beatmatch = False  # il leader non ha un beat rilevabile: fallback a piazzamento casuale
+    if beatmatch and phrase_beats:
+        frase_grid = group_beats_into_phrases(beat_grid, phrase_beats)
+        if frase_grid:
+            beat_grid = frase_grid  # aggancio solo agli inizi di frase, non a ogni beat
 
     weights_list = None
     if deck_weights:
@@ -356,6 +473,10 @@ def build_dj_remix_overlay(leader_y, leader_sr, overlay_segments, overlay_gain, 
         seg_len = seg.shape[1]
         if seg_len <= 0 or seg_len > total:
             continue
+        if bass_cutoff_hz:
+            # EQ Bass Swap: tolgo i bassi dall'overlay PRIMA di sommarlo, non dopo — cosi'
+            # il leader sotto resta con la sua linea di basso intatta e pulita.
+            seg = apply_bass_cut(seg, leader_sr, cutoff_hz=bass_cutoff_hz)
 
         if beatmatch:
             beat_pos = rng.choice(beat_grid)
@@ -831,6 +952,11 @@ if active_decks:
         num_overlay_events = 60
         dj_bpm_align = True
         dj_beatmatch = True
+        dj_phrase_match = False
+        dj_beats_per_phrase = 8
+        dj_key_check = False
+        dj_bass_swap = False
+        dj_bass_cutoff = 150
         if apply_dj_remix:
             dj_leader_key = st.sidebar.selectbox(
                 "Deck da tenere intatto (base):",
@@ -857,6 +983,43 @@ if active_decks:
                      "casuale, ma il suo attacco più forte viene fatto combaciare esattamente "
                      "con un beat del leader — proprio come farebbe un DJ mixando ad orecchio."
             )
+
+            st.sidebar.markdown("**🧪 Sperimentale — tecniche DJ avanzate**")
+
+            dj_phrase_match = st.sidebar.checkbox(
+                "🎼 Aggancio a frasi musicali (non al singolo beat)", value=False,
+                help="I DJ non allineano solo i beat, allineano le FRASI (blocchi di 8/16 "
+                     "battute: intro, verse, drop...). Se attivo, gli overlay si agganciano "
+                     "solo all'inizio di una frase, non a un beat qualsiasi in mezzo. Richiede "
+                     "il beatmatching attivo qui sopra."
+            )
+            dj_beats_per_phrase = 8
+            if dj_phrase_match:
+                dj_beats_per_phrase = st.sidebar.select_slider(
+                    "Battute per frase:", options=[4, 8, 16, 32], value=8
+                )
+
+            dj_key_check = st.sidebar.checkbox(
+                "🎵 Rilevamento tonalità (Camelot) tra leader e follower", value=False,
+                help="Rileva la tonalità di ogni deck (algoritmo Krumhansl-Schmuckler, come "
+                     "Mixed In Key) e mostra la compatibilità armonica col leader secondo la "
+                     "Camelot Wheel. Solo informativo: non altera l'audio, ti aiuta a scegliere."
+            )
+
+            dj_bass_swap = st.sidebar.checkbox(
+                "🎚️ EQ Bass Swap (taglia i bassi degli overlay)", value=False,
+                help="I DJ tagliano i bassi di una traccia quando ne sovrappongono un'altra, "
+                     "per evitare che le due linee di basso 'impastino'. Se attivo, ogni "
+                     "frammento overlay viene filtrato con un passa-alto prima di essere "
+                     "sommato, lasciando i bassi puliti al solo leader."
+            )
+            dj_bass_cutoff = 150
+            if dj_bass_swap:
+                dj_bass_cutoff = st.sidebar.slider(
+                    "Frequenza di taglio (Hz):", 60, 400, 150, step=10,
+                    help="Sotto questa frequenza, i bassi dell'overlay vengono rimossi."
+                )
+
             st.sidebar.caption(
                 f"I frammenti verranno presi da tutti i deck TRANNE {dj_leader_key.upper() if dj_leader_key else '—'} "
                 "(quello resta la base intatta)."
@@ -909,6 +1072,24 @@ if active_decks:
                                 s['audio'] = librosa.resample(s['audio'], orig_sr=s['sr'], target_sr=ref_sr)
                                 s['sr'] = ref_sr
 
+                        # --- Rilevamento tonalità (Camelot): solo informativo, non altera
+                        # l'audio, ti aiuta a scegliere quali deck stanno bene insieme. ---
+                        camelot_info = []
+                        if dj_key_check:
+                            with st.spinner("Rilevo le tonalità (Camelot)..."):
+                                leader_nome, leader_camelot, leader_conf = detect_key_camelot(dj_leader_d['y'], ref_sr)
+                                follower_decks_coinvolti = sorted({s['deck'] for s in overlay_pool_raw})
+                                for fk in follower_decks_coinvolti:
+                                    f_nome, f_camelot, f_conf = detect_key_camelot(active_decks[fk]['y'], active_decks[fk]['sr'])
+                                    compat = camelot_compatibility(leader_camelot, f_camelot)
+                                    camelot_info.append((fk, f_nome, f_camelot, compat))
+                            if leader_camelot:
+                                st.sidebar.info(f"🎵 Leader {dj_leader_key.upper()}: {leader_nome} ({leader_camelot})")
+                                emoji_compat = {"identica": "🟢", "adiacente": "🟢", "relativa": "🟡", "dissonante": "🔴", None: "⚪"}
+                                for fk, f_nome, f_camelot, compat in camelot_info:
+                                    label = compat if compat else "non rilevabile"
+                                    st.sidebar.caption(f"{emoji_compat.get(compat,'⚪')} Deck {fk.upper()}: {f_nome} ({f_camelot}) — {label}")
+
                         # --- Auto-allineamento BPM: ogni follower viene stretchato al tempo del
                         # leader PRIMA di essere sparso come overlay, cosi' suona davvero alla
                         # stessa velocità (non solo tagliato alla stessa lunghezza). ---
@@ -938,7 +1119,9 @@ if active_decks:
                         with st.spinner("Sovrappongo i frammenti (DJ Remix)..."):
                             final_y, eventi_piazzati, dj_events = build_dj_remix_overlay(
                                 dj_leader_d['y'], ref_sr, overlay_pool, overlay_gain, num_overlay_events,
-                                rng, deck_weights, beatmatch=dj_beatmatch
+                                rng, deck_weights, beatmatch=dj_beatmatch,
+                                phrase_beats=dj_beats_per_phrase if dj_phrase_match else None,
+                                bass_cutoff_hz=dj_bass_cutoff if dj_bass_swap else None,
                             )
                         chosen = [True]  # solo per riusare il check "if not chosen" sotto
 
@@ -1023,7 +1206,7 @@ if active_decks:
                     # --- PRESET RIPRODUCIBILE (seed + parametri) ---
                     preset = {
                         "loop507_hyper_mixer_preset": True,
-                        "versione_app": "5.2",
+                        "versione_app": "5.3",
                         "seed": seed_used,
                         "modalita_taglio": tipo_taglio,
                         "parametro_taglio": taglio_meta,
@@ -1034,6 +1217,11 @@ if active_decks:
                             "num_eventi": num_overlay_events,
                             "bpm_align": dj_bpm_align,
                             "beatmatch": dj_beatmatch,
+                            "phrase_match": dj_phrase_match,
+                            "beats_per_phrase": dj_beats_per_phrase if dj_phrase_match else None,
+                            "key_check": dj_key_check,
+                            "bass_swap": dj_bass_swap,
+                            "bass_cutoff_hz": dj_bass_cutoff if dj_bass_swap else None,
                         } if apply_dj_remix else None,
                         "crossfade_ms": crossfade_ms if (apply_crossfade and not apply_dj_remix) else 0,
                         "pesi_deck": deck_weights,
@@ -1058,10 +1246,23 @@ if active_decks:
                             n_align = len(decks_allineati)
                             allineamento_info = f" / BPM allineato su {n_align} follower" if n_align else " / nessun follower necessitava allineamento"
                         beatmatch_info = " / Beatmatching attivo (picchi agganciati)" if dj_beatmatch else " / Beatmatching disattivato (piazzamento casuale)"
-                        processo_it = f"DJ Remix: Deck {dj_leader_key.upper()} intatto come base / {eventi_piazzati} overlay sparsi (seed {seed_used}){allineamento_info}{beatmatch_info} / Stereo Preservato"
-                        processo_en = f"DJ Remix: Deck {dj_leader_key.upper()} kept intact as base / {eventi_piazzati} scattered overlays (seed {seed_used}) / Stereo Preserved"
-                        extra_it = f"* Deck Base (intatto): {dj_leader_key.upper()}\n* Overlay Piazzati: {eventi_piazzati} (volume {overlay_gain:.2f}x)\n* Allineamento BPM: {'attivo' if dj_bpm_align else 'disattivo'}\n* Beatmatching: {'attivo' if dj_beatmatch else 'disattivo'}"
-                        extra_en = f"* Base Deck (intact): {dj_leader_key.upper()}\n* Overlays Placed: {eventi_piazzati} (gain {overlay_gain:.2f}x)\n* BPM Alignment: {'on' if dj_bpm_align else 'off'}\n* Beatmatching: {'on' if dj_beatmatch else 'off'}"
+                        sperimentale_bits_it = []
+                        sperimentale_bits_en = []
+                        if dj_phrase_match:
+                            sperimentale_bits_it.append(f"Aggancio a frasi ({dj_beats_per_phrase} battute)")
+                            sperimentale_bits_en.append(f"Phrase matching ({dj_beats_per_phrase} beats)")
+                        if dj_key_check:
+                            sperimentale_bits_it.append("Rilevamento tonalità Camelot")
+                            sperimentale_bits_en.append("Camelot key detection")
+                        if dj_bass_swap:
+                            sperimentale_bits_it.append(f"EQ Bass Swap (taglio sotto {dj_bass_cutoff}Hz)")
+                            sperimentale_bits_en.append(f"EQ Bass Swap (cut below {dj_bass_cutoff}Hz)")
+                        sperimentale_info_it = f" / {' / '.join(sperimentale_bits_it)}" if sperimentale_bits_it else ""
+                        sperimentale_info_en = f" / {' / '.join(sperimentale_bits_en)}" if sperimentale_bits_en else ""
+                        processo_it = f"DJ Remix: Deck {dj_leader_key.upper()} intatto come base / {eventi_piazzati} overlay sparsi (seed {seed_used}){allineamento_info}{beatmatch_info}{sperimentale_info_it} / Stereo Preservato"
+                        processo_en = f"DJ Remix: Deck {dj_leader_key.upper()} kept intact as base / {eventi_piazzati} scattered overlays (seed {seed_used}){sperimentale_info_en} / Stereo Preserved"
+                        extra_it = f"* Deck Base (intatto): {dj_leader_key.upper()}\n* Overlay Piazzati: {eventi_piazzati} (volume {overlay_gain:.2f}x)\n* Allineamento BPM: {'attivo' if dj_bpm_align else 'disattivo'}\n* Beatmatching: {'attivo' if dj_beatmatch else 'disattivo'}\n* Aggancio a frasi: {f'{dj_beats_per_phrase} battute' if dj_phrase_match else 'disattivo'}\n* EQ Bass Swap: {f'sotto {dj_bass_cutoff}Hz' if dj_bass_swap else 'disattivo'}"
+                        extra_en = f"* Base Deck (intact): {dj_leader_key.upper()}\n* Overlays Placed: {eventi_piazzati} (gain {overlay_gain:.2f}x)\n* BPM Alignment: {'on' if dj_bpm_align else 'off'}\n* Beatmatching: {'on' if dj_beatmatch else 'off'}\n* Phrase Matching: {f'{dj_beats_per_phrase} beats' if dj_phrase_match else 'off'}\n* EQ Bass Swap: {f'below {dj_bass_cutoff}Hz' if dj_bass_swap else 'off'}"
                     else:
                         processo_it = f"Shuffling Ricorsivo (seed {seed_used}) / Cross-Deck Fragmentation / Sample Rate Uniformato / Stereo Preservato / Pesi Deck Personalizzati"
                         processo_en = f"Recursive Shuffling (seed {seed_used}) / Cross-Deck Fragmentation / Uniform Sample Rate / Stereo Preserved / Custom Deck Weights"
@@ -1070,7 +1271,7 @@ if active_decks:
 
                     st.session_state.audio_report = f"""
 ╔════════════════════════════════════════════════════════════════╗
-  HYPER-MIXER v5.2 - AUDIO RECONSTRUCTION LOG (STEREO + DJ REMIX + MIDI)
+  HYPER-MIXER v5.3 - AUDIO RECONSTRUCTION LOG (STEREO + DJ REMIX + MIDI)
   Generated on: {ts_audio}
 ╚════════════════════════════════════════════════════════════════╝
 
@@ -1078,7 +1279,7 @@ if active_decks:
 
 ═══════════════════ ITALIANO ═══════════════════
 
-:: ENGINE: hyper_mixer_loop507 [v5.2]
+:: ENGINE: hyper_mixer_loop507 [v5.3]
 :: ANALISI: Beat Tracking (Librosa) / RMS Envelope / Onset Detection
 :: STILE: Audio-Glitch / Granular Synthesis
 :: PROCESSO: {processo_it}
@@ -1096,7 +1297,7 @@ if active_decks:
 
 ═══════════════════ ENGLISH ═══════════════════
 
-:: ENGINE: hyper_mixer_loop507 [v5.2]
+:: ENGINE: hyper_mixer_loop507 [v5.3]
 :: ANALYSIS: Beat Tracking (Librosa) / RMS Envelope / Onset Detection
 :: STYLE: Audio-Glitch / Granular Synthesis
 :: PROCESS: {processo_en}
@@ -1154,4 +1355,4 @@ if st.session_state.get('mix_ready'):
             st.caption("🎹 Export MIDI non disponibile: aggiungi 'mido' a requirements.txt.")
 
 st.markdown("---")
-st.caption("Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva | Stereo + DJ Remix + MIDI + Precisione BPM v5.2")
+st.caption("Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva | Stereo + DJ Remix + Tecniche DJ Avanzate v5.3")
