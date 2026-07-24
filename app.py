@@ -154,6 +154,112 @@ def camelot_compatibility(camelot_a, camelot_b):
     return "dissonante"
 
 
+_COMPAT_SCORE = {"identica": 3, "adiacente": 3, "relativa": 2, "dissonante": 0, None: 1}
+_COMPAT_EMOJI = {"identica": "🟢", "adiacente": "🟢", "relativa": "🟡", "dissonante": "🔴", None: "⚪"}
+
+
+def build_batch_report(results, order, target_bpm, saltate):
+    """Report bilingue IT/EN in stile Loop507: per ogni traccia mostra l'analisi originale
+    (BPM, tonalità) e cosa è stato modificato (BPM target, rate applicato), più la scaletta
+    suggerita per compatibilità armonica Camelot."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    righe_it = []
+    righe_en = []
+    for r in results:
+        if r['tempo'] <= 0:
+            righe_it.append(f"* {r['name']}: BPM non rilevato — traccia esclusa dall'allineamento")
+            righe_en.append(f"* {r['name']}: no BPM detected — track excluded from alignment")
+            continue
+        rate = target_bpm / r['tempo']
+        righe_it.append(
+            f"* {r['name']}\n"
+            f"    Originale: {r['tempo']:.1f} BPM — {r['key_nome']} ({r['camelot']})\n"
+            f"    Modificato: portato a {target_bpm:.1f} BPM (rate {rate:.3f}x) — "
+            f"tonalità invariata, intonazione preservata (time-stretch phase vocoder)"
+        )
+        righe_en.append(
+            f"* {r['name']}\n"
+            f"    Original: {r['tempo']:.1f} BPM — {r['key_nome']} ({r['camelot']})\n"
+            f"    Modified: brought to {target_bpm:.1f} BPM (rate {rate:.3f}x) — "
+            f"key unchanged, pitch preserved (phase vocoder time-stretch)"
+        )
+
+    scaletta_it = ["\n> SCALETTA IDEALE (compatibilità armonica Camelot, ordine suggerito):"]
+    scaletta_en = ["\n> SUGGESTED PLAYLIST ORDER (Camelot harmonic compatibility):"]
+    for pos, idx in enumerate(order):
+        r = results[idx]
+        if pos == 0:
+            scaletta_it.append(f"  1. {r['name']} — {r['camelot']}")
+            scaletta_en.append(f"  1. {r['name']} — {r['camelot']}")
+        else:
+            prev = results[order[pos - 1]]
+            compat = camelot_compatibility(prev['camelot'], r['camelot'])
+            emoji = _COMPAT_EMOJI[compat]
+            label_it = compat if compat else "non rilevabile"
+            label_en = {"identica": "identical", "adiacente": "adjacent", "relativa": "relative",
+                        "dissonante": "clashing", None: "unknown"}.get(compat, "unknown")
+            scaletta_it.append(f"  {pos+1}. {r['name']} — {r['camelot']}  {emoji} ({label_it} rispetto alla precedente)")
+            scaletta_en.append(f"  {pos+1}. {r['name']} — {r['camelot']}  {emoji} ({label_en} vs previous)")
+
+    saltate_it = f"\n> ESCLUSE DALLA SCALETTA (nessun BPM rilevato): {', '.join(saltate)}" if saltate else ""
+    saltate_en = f"\n> EXCLUDED FROM PLAYLIST (no BPM detected): {', '.join(saltate)}" if saltate else ""
+
+    return f"""
+╔════════════════════════════════════════════════════════════════╗
+  LOOP507 :: BATCH BPM MATCHER REPORT
+  Generated on: {ts}
+╚════════════════════════════════════════════════════════════════╝
+
+═══════════════════ ITALIANO ═══════════════════
+
+:: ENGINE: batch_bpm_matcher_loop507
+:: ANALISI: BPM raffinato (mediana intervalli beat) + correzione ottava + tonalità Camelot (Krumhansl-Schmuckler)
+:: BPM TARGET: {target_bpm:.1f}
+
+> TRACCE:
+{chr(10).join(righe_it)}
+{chr(10).join(scaletta_it)}{saltate_it}
+
+═══════════════════ ENGLISH ═══════════════════
+
+:: ENGINE: batch_bpm_matcher_loop507
+:: ANALYSIS: refined BPM (beat interval median) + octave correction + Camelot key (Krumhansl-Schmuckler)
+:: TARGET BPM: {target_bpm:.1f}
+
+> TRACKS:
+{chr(10).join(righe_en)}
+{chr(10).join(scaletta_en)}{saltate_en}
+
+> Regia e Algoritmo / Direction & Algorithm: Loop507
+#Loop507 #BatchBPMMatcher #HarmonicMixing #CamelotWheel
+"""
+
+
+def suggest_camelot_order(results):
+    """Calcola una scaletta suggerita che massimizza la compatibilità armonica tra brani
+    consecutivi: euristica greedy (nearest-neighbor) — parte dal primo brano caricato, poi ad
+    ogni passo sceglie tra quelli rimasti il più compatibile col brano appena piazzato.
+    Non è garantito l'ordine matematicamente ottimo (richiederebbe un solver completo, eccessivo
+    per 5-10 tracce), ma è lo stesso approccio pratico che userebbe un DJ scorrendo la Camelot
+    Wheel a mano. Ritorna la lista di indici in 'results' nell'ordine suggerito."""
+    n = len(results)
+    if n <= 1:
+        return list(range(n))
+    remaining = set(range(n))
+    order = [0]
+    remaining.discard(0)
+    while remaining:
+        last_camelot = results[order[-1]]['camelot']
+        best_idx, best_score = None, -1
+        for idx in remaining:
+            score = _COMPAT_SCORE[camelot_compatibility(last_camelot, results[idx]['camelot'])]
+            if score > best_score:
+                best_idx, best_score = idx, score
+        order.append(best_idx)
+        remaining.discard(best_idx)
+    return order
+
+
 # --- Aggancio a frasi musicali (8/16 battute), non solo al singolo beat -------------------
 def group_beats_into_phrases(beat_grid_samples, beats_per_phrase=8):
     """I DJ non allineano solo i beat, allineano le FRASI (blocchi di 8/16 battute: intro,
@@ -747,6 +853,7 @@ with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa veloc
     if batch_files and st.button("🔍 Analizza tutte le tracce", key="batch_analyze_btn"):
         st.session_state.batch_results = []
         st.session_state.batch_zip = None  # un nuovo batch invalida lo zip precedente
+        st.session_state.batch_report = None
         progress = st.progress(0.0, text="Analizzo...")
         for i, bf in enumerate(batch_files):
             with st.spinner(f"Analizzo {bf.name}..."):
@@ -793,10 +900,23 @@ with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa veloc
                         if mp3_buffer:
                             base_name = os.path.splitext(r['name'])[0]
                             zf.writestr(f"{base_name}_{target_bpm:.0f}bpm.mp3", mp3_buffer.read())
+
+                    # Scaletta ideale per compatibilità armonica (solo tra le tracce con
+                    # tonalità rilevabile e BPM valido, cosi' l'ordine ha davvero un senso)
+                    tracce_ordinabili = [r for r in st.session_state.batch_results if r['tempo'] > 0]
+                    ordine = suggest_camelot_order(tracce_ordinabili)
+                    report_text = build_batch_report(tracce_ordinabili, ordine, target_bpm, saltate)
+                    zf.writestr("report_batch_bpm_matcher.txt", report_text)
+                    st.session_state.batch_report = report_text
+
                 zip_buffer.seek(0)
                 st.session_state.batch_zip = zip_buffer.getvalue()
                 if saltate:
                     st.info(f"Saltate (nessun BPM rilevato): {', '.join(saltate)}")
+
+    if st.session_state.get('batch_report'):
+        with st.expander("📄 Anteprima report (incluso nello ZIP)"):
+            st.text(st.session_state.batch_report)
 
     if st.session_state.batch_zip:
         st.download_button(
