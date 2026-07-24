@@ -8,6 +8,7 @@ import os
 import random
 import shutil
 import json
+import zipfile
 from datetime import datetime
 
 try:
@@ -720,6 +721,88 @@ correggi_ottava = st.sidebar.checkbox(
 bpm_range_plausibile = st.sidebar.slider(
     "Range BPM plausibile:", 40, 220, (70, 180), disabled=not correggi_ottava
 )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 📦 BATCH BPM MATCHER — tool separato e indipendente dall'Hyper-Mixer.
+# Usa lo stesso session_state prefix "batch_" per non toccare in alcun modo lo
+# stato dei deck/segmenti/mix: zero rischio di interferenza con il resto dell'app.
+# ═══════════════════════════════════════════════════════════════════════════════
+with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa velocità", expanded=False):
+    st.caption(
+        "Carica 5-10 mp3/wav: vengono analizzati (BPM raffinato + tonalità Camelot, stessi "
+        "algoritmi dell'Hyper-Mixer), poi puoi portarli tutti alla stessa velocità (intonazione "
+        "preservata) e scaricarli in un unico ZIP."
+    )
+
+    if 'batch_results' not in st.session_state:
+        st.session_state.batch_results = []  # lista di dict: name, y, sr, tempo, key_nome, camelot
+    if 'batch_zip' not in st.session_state:
+        st.session_state.batch_zip = None
+
+    batch_files = st.file_uploader(
+        "Carica le tracce (mp3/wav):", type=["mp3", "wav"], accept_multiple_files=True,
+        key="batch_uploader"
+    )
+
+    if batch_files and st.button("🔍 Analizza tutte le tracce", key="batch_analyze_btn"):
+        st.session_state.batch_results = []
+        st.session_state.batch_zip = None  # un nuovo batch invalida lo zip precedente
+        progress = st.progress(0.0, text="Analizzo...")
+        for i, bf in enumerate(batch_files):
+            with st.spinner(f"Analizzo {bf.name}..."):
+                y, sr, t = analyze_track(bf)
+                if correggi_ottava and t > 0:
+                    t = correggi_errore_ottava(t, bpm_range_plausibile[0], bpm_range_plausibile[1])
+                key_nome, camelot, _ = detect_key_camelot(y, sr)
+                st.session_state.batch_results.append({
+                    'name': bf.name, 'y': y, 'sr': sr, 'tempo': t,
+                    'key_nome': key_nome or "n/d", 'camelot': camelot or "?"
+                })
+            progress.progress((i + 1) / len(batch_files), text=f"Analizzato {bf.name}")
+        progress.empty()
+
+    if st.session_state.batch_results:
+        st.write("**Tracce analizzate:**")
+        for r in st.session_state.batch_results:
+            bpm_label = f"{r['tempo']:.1f} BPM" if r['tempo'] > 0 else "BPM non rilevato"
+            st.caption(f"🎵 {r['name']} — {bpm_label} — {r['key_nome']} ({r['camelot']})")
+
+        tempi_validi = [r['tempo'] for r in st.session_state.batch_results if r['tempo'] > 0]
+        if not tempi_validi:
+            st.warning("Nessuna traccia ha un BPM rilevato: impossibile calcolare una velocità comune.")
+        else:
+            mediana_bpm = float(np.median(tempi_validi))
+            target_bpm = st.number_input(
+                "🎯 BPM target per tutte le tracce:", min_value=20.0, max_value=300.0,
+                value=round(mediana_bpm, 1), step=1.0,
+                help=f"Precompilato con la mediana del gruppo ({mediana_bpm:.1f} BPM), modificabile."
+            )
+
+            if st.button("🚀 Allinea tutte e genera ZIP", key="batch_align_btn"):
+                zip_buffer = BytesIO()
+                saltate = []
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for r in st.session_state.batch_results:
+                        if r['tempo'] <= 0:
+                            saltate.append(r['name'])
+                            continue  # nessun BPM di riferimento: non c'e' un rate calcolabile
+                        with st.spinner(f"Allineo {r['name']}..."):
+                            rate = target_bpm / r['tempo']
+                            y_stretched = time_stretch_stereo(r['y'], rate)
+                            mp3_buffer = export_audio(y_stretched, r['sr'])
+                        if mp3_buffer:
+                            base_name = os.path.splitext(r['name'])[0]
+                            zf.writestr(f"{base_name}_{target_bpm:.0f}bpm.mp3", mp3_buffer.read())
+                zip_buffer.seek(0)
+                st.session_state.batch_zip = zip_buffer.getvalue()
+                if saltate:
+                    st.info(f"Saltate (nessun BPM rilevato): {', '.join(saltate)}")
+
+    if st.session_state.batch_zip:
+        st.download_button(
+            "📥 Scarica ZIP con le tracce allineate", st.session_state.batch_zip,
+            "loop507_batch_allineato.zip", mime="application/zip", use_container_width=True
+        )
 
 deck_keys = list(st.session_state.decks.keys())
 for row_idx in [0, 4]:
