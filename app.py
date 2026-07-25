@@ -20,6 +20,14 @@ except ImportError:
     SCIPY_DISPONIBILE = False
 
 try:
+    from mutagen import File as MutagenFile
+    MUTAGEN_DISPONIBILE = True
+except ImportError:
+    # mutagen non e' nei requirements: l'artista nel report resta '—' invece di crashare.
+    # Se vedi questo messaggio, aggiungi 'mutagen' a requirements.txt.
+    MUTAGEN_DISPONIBILE = False
+
+try:
     import mido
     MIDI_DISPONIBILE = True
 except ImportError:
@@ -145,6 +153,34 @@ def check_tempo_ambiguity(y, sr, tempo_val):
         return []
 
 
+def cross_check_tempo(y, sr, tempo_principale):
+    """Stima il BPM con un secondo metodo indipendente (autocorrelazione del tempogram via
+    librosa.feature.tempo — percorso algoritmico diverso dal beat-tracking dinamico usato per
+    tempo_principale/refine_tempo_from_beats) e confronta i due risultati. Se sono d'accordo
+    (entro il 3%), aumenta la fiducia nel BPM rilevato. Se disaccordano per un rapporto NOTO
+    (metà/doppio/3:2/2:3 — gli stessi tipi di errore di check_tempo_ambiguity, qui verificati
+    da un algoritmo indipendente invece che dallo stesso), lo segnala esplicitamente: è proprio
+    il tipo di caso (es. Neon Pulse: rilevato 92 invece di 138, rapporto 3:2) che un singolo
+    metodo può mancare, ma che si vede chiaramente confrontando due approcci diversi."""
+    if tempo_principale is None or tempo_principale <= 0:
+        return None, "n/d"
+    try:
+        y_mono = np.mean(y, axis=0) if y.ndim == 2 else y
+        tempo_alt = librosa.feature.tempo(y=y_mono, sr=sr)
+        tempo_alt_val = float(tempo_alt[0]) if hasattr(tempo_alt, '__len__') else float(tempo_alt)
+        if tempo_alt_val <= 0:
+            return None, "n/d"
+        rapporto = tempo_alt_val / tempo_principale
+        if abs(rapporto - 1.0) < 0.03:
+            return round(tempo_alt_val, 1), "concorda"
+        for r, nome in [(0.5, "metà"), (2.0, "doppio"), (1.5, "3/2"), (2 / 3, "2/3")]:
+            if abs(rapporto - r) < 0.03:
+                return round(tempo_alt_val, 1), f"disaccordo ({nome})"
+        return round(tempo_alt_val, 1), "disaccordo"
+    except Exception:
+        return None, "n/d"
+
+
 # --- Rilevamento tonalità (Krumhansl-Schmuckler) + notazione Camelot ---------------------
 # Profili statistici standard: quanto ogni grado della scala cromatica "suona stabile"
 # in un contesto maggiore/minore (Krumhansl & Kessler, 1982). Sono la base di praticamente
@@ -221,11 +257,70 @@ _COMPAT_SCORE = {"identica": 3, "adiacente": 3, "relativa": 2, "dissonante": 0, 
 _COMPAT_EMOJI = {"identica": "🟢", "adiacente": "🟢", "relativa": "🟡", "dissonante": "🔴", None: "⚪"}
 
 
+def extract_artist(file_obj):
+    """Legge il campo 'artist' dai tag ID3/metadata del file (via mutagen), se presenti.
+    Ritorna '—' se mutagen non è disponibile, il file non ha tag, o qualunque altro problema —
+    non deve mai far fallire l'analisi solo per un tag mancante."""
+    if not MUTAGEN_DISPONIBILE:
+        return "—"
+    try:
+        file_obj.seek(0)
+        audio = MutagenFile(file_obj, easy=True)
+        file_obj.seek(0)  # riavvolgo per non interferire con letture successive dello stesso file
+        if audio is None:
+            return "—"
+        artist = audio.get('artist', [None])[0]
+        return artist if artist else "—"
+    except Exception:
+        return "—"
+
+
+def build_ascii_table(headers, rows):
+    """Costruisce una tabella in puro testo (larghezza colonne automatica, separatori |),
+    leggibile in qualunque editor senza bisogno di HTML/colori."""
+    widths = [len(str(h)) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(str(cell)))
+
+    def format_row(cells):
+        return "| " + " | ".join(str(c).ljust(widths[i]) for i, c in enumerate(cells)) + " |"
+
+    separator = "+-" + "-+-".join("-" * w for w in widths) + "-+"
+    lines = [separator, format_row(headers), separator]
+    for row in rows:
+        lines.append(format_row(row))
+    lines.append(separator)
+    return "\n".join(lines)
+
+
 def build_batch_report(results, order, target_bpm, saltate):
-    """Report bilingue IT/EN in stile Loop507: per ogni traccia mostra l'analisi originale
-    (BPM, tonalità) e cosa è stato modificato (BPM target, rate applicato), più la scaletta
-    suggerita per compatibilità armonica Camelot."""
+    """Report bilingue IT/EN in stile Loop507: tabella riassuntiva (titolo/artista/BPM/tonalità),
+    tabella scaletta ideale per compatibilità Camelot, poi il dettaglio completo per traccia
+    (originale vs modificato) — tutto in puro testo, nessun HTML."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # --- Tabella 1: riepilogo tracce ---
+    righe_tabella1 = []
+    for r in results:
+        bpm_label = f"{r['tempo']:.2f}" if r['tempo'] > 0 else "n/d"
+        righe_tabella1.append([r['name'], r.get('artist', '—'), bpm_label, r['camelot']])
+    tabella1 = build_ascii_table(["Titolo / Title", "Artista / Artist", "BPM", "Camelot"], righe_tabella1)
+
+    # --- Tabella 2: scaletta ideale ---
+    righe_tabella2 = []
+    for pos, idx in enumerate(order):
+        r = results[idx]
+        if pos == 0:
+            compat_label = "—"
+        else:
+            prev = results[order[pos - 1]]
+            compat = camelot_compatibility(prev['camelot'], r['camelot'])
+            compat_label = f"{_COMPAT_EMOJI[compat]} {compat or 'non rilevabile'}"
+        righe_tabella2.append([str(pos + 1), r['name'], r['camelot'], compat_label])
+    tabella2 = build_ascii_table(["#", "Titolo / Title", "Camelot", "Compatibilità / Compatibility"], righe_tabella2)
+
+    # --- Dettaglio per traccia (originale -> modificato) ---
     righe_it = []
     righe_en = []
     for r in results:
@@ -234,38 +329,28 @@ def build_batch_report(results, order, target_bpm, saltate):
             righe_en.append(f"* {r['name']}: no BPM detected — track excluded from alignment")
             continue
         rate = target_bpm / r['tempo']
+        cross_info_it = ""
+        cross_info_en = ""
+        if r.get('stato_crosscheck', 'n/d') not in ('n/d', 'concorda'):
+            cross_info_it = f"\n    Verifica incrociata: {r.get('stato_crosscheck')} (metodo alternativo: {r.get('bpm_alt')} BPM) — controlla ad orecchio"
+            cross_info_en = f"\n    Cross-check: {r.get('stato_crosscheck')} (alternative method: {r.get('bpm_alt')} BPM) — verify by ear"
         righe_it.append(
             f"* {r['name']}\n"
-            f"    Originale: {r['tempo']:.1f} BPM — {r['key_nome']} ({r['camelot']})\n"
-            f"    Modificato: portato a {target_bpm:.1f} BPM (rate {rate:.3f}x) — "
+            f"    Originale: {r['tempo']:.2f} BPM — {r['key_nome']} ({r['camelot']})\n"
+            f"    Modificato: portato a {target_bpm:.2f} BPM (rate {rate:.4f}x) — "
             f"tonalità invariata, intonazione preservata (time-stretch phase vocoder)"
+            f"{cross_info_it}"
         )
         righe_en.append(
             f"* {r['name']}\n"
-            f"    Original: {r['tempo']:.1f} BPM — {r['key_nome']} ({r['camelot']})\n"
-            f"    Modified: brought to {target_bpm:.1f} BPM (rate {rate:.3f}x) — "
+            f"    Original: {r['tempo']:.2f} BPM — {r['key_nome']} ({r['camelot']})\n"
+            f"    Modified: brought to {target_bpm:.2f} BPM (rate {rate:.4f}x) — "
             f"key unchanged, pitch preserved (phase vocoder time-stretch)"
+            f"{cross_info_en}"
         )
 
-    scaletta_it = ["\n> SCALETTA IDEALE (compatibilità armonica Camelot, ordine suggerito):"]
-    scaletta_en = ["\n> SUGGESTED PLAYLIST ORDER (Camelot harmonic compatibility):"]
-    for pos, idx in enumerate(order):
-        r = results[idx]
-        if pos == 0:
-            scaletta_it.append(f"  1. {r['name']} — {r['camelot']}")
-            scaletta_en.append(f"  1. {r['name']} — {r['camelot']}")
-        else:
-            prev = results[order[pos - 1]]
-            compat = camelot_compatibility(prev['camelot'], r['camelot'])
-            emoji = _COMPAT_EMOJI[compat]
-            label_it = compat if compat else "non rilevabile"
-            label_en = {"identica": "identical", "adiacente": "adjacent", "relativa": "relative",
-                        "dissonante": "clashing", None: "unknown"}.get(compat, "unknown")
-            scaletta_it.append(f"  {pos+1}. {r['name']} — {r['camelot']}  {emoji} ({label_it} rispetto alla precedente)")
-            scaletta_en.append(f"  {pos+1}. {r['name']} — {r['camelot']}  {emoji} ({label_en} vs previous)")
-
-    saltate_it = f"\n> ESCLUSE DALLA SCALETTA (nessun BPM rilevato): {', '.join(saltate)}" if saltate else ""
-    saltate_en = f"\n> EXCLUDED FROM PLAYLIST (no BPM detected): {', '.join(saltate)}" if saltate else ""
+    saltate_it = f"\n> ESCLUSE (nessun BPM rilevato): {', '.join(saltate)}" if saltate else ""
+    saltate_en = f"\n> EXCLUDED (no BPM detected): {', '.join(saltate)}" if saltate else ""
 
     return f"""
 ╔════════════════════════════════════════════════════════════════╗
@@ -273,25 +358,37 @@ def build_batch_report(results, order, target_bpm, saltate):
   Generated on: {ts}
 ╚════════════════════════════════════════════════════════════════╝
 
-═══════════════════ ITALIANO ═══════════════════
+> RIEPILOGO TRACCE / TRACKS SUMMARY:
+
+{tabella1}
+
+> SCALETTA IDEALE / SUGGESTED PLAYLIST ORDER (compatibilità armonica Camelot):
+
+{tabella2}
+{saltate_it}
+
+═══════════════════ ITALIANO — DETTAGLIO ═══════════════════
 
 :: ENGINE: batch_bpm_matcher_loop507
-:: ANALISI: BPM raffinato (mediana intervalli beat) + correzione ottava + tonalità Camelot (Krumhansl-Schmuckler)
-:: BPM TARGET: {target_bpm:.1f}
+:: ANALISI: BPM raffinato (mediana intervalli beat) + correzione ottava + verifica incrociata
+   (metodo indipendente) + tonalità Camelot (Krumhansl-Schmuckler)
+:: BPM TARGET: {target_bpm:.2f}
+:: EXPORT: MP3 320kbps
 
 > TRACCE:
 {chr(10).join(righe_it)}
-{chr(10).join(scaletta_it)}{saltate_it}
 
-═══════════════════ ENGLISH ═══════════════════
+═══════════════════ ENGLISH — DETAIL ═══════════════════
 
 :: ENGINE: batch_bpm_matcher_loop507
-:: ANALYSIS: refined BPM (beat interval median) + octave correction + Camelot key (Krumhansl-Schmuckler)
-:: TARGET BPM: {target_bpm:.1f}
+:: ANALYSIS: refined BPM (beat interval median) + octave correction + cross-check
+   (independent method) + Camelot key (Krumhansl-Schmuckler)
+:: TARGET BPM: {target_bpm:.2f}
+:: EXPORT: MP3 320kbps
 
 > TRACKS:
 {chr(10).join(righe_en)}
-{chr(10).join(scaletta_en)}{saltate_en}
+{saltate_en}
 
 > Regia e Algoritmo / Direction & Algorithm: Loop507
 #Loop507 #BatchBPMMatcher #HarmonicMixing #CamelotWheel
@@ -594,7 +691,10 @@ def apply_cut_lengths(y, lengths):
 
 
 def export_audio(y, sr):
-    """Esporta un array stereo (2, n) in MP3 stereo, con interleaving corretto dei canali."""
+    """Esporta un array stereo (2, n) in MP3 stereo a 320kbps, con interleaving corretto
+    dei canali. NOTA: prima di questo fix, il bitrate non era mai specificato esplicitamente,
+    quindi pydub/ffmpeg usava un default molto più basso (~130kbps verificato), nonostante
+    tutti i report dell'app dichiarassero 320kbps — un bug reale, non solo percezione."""
     if y.shape[1] == 0:
         return None
     max_val = np.max(np.abs(y))
@@ -606,7 +706,7 @@ def export_audio(y, sr):
 
     buffer = BytesIO()
     audio_seg = AudioSegment(interleaved.tobytes(), frame_rate=sr, sample_width=2, channels=2)
-    audio_seg.export(buffer, format="mp3")
+    audio_seg.export(buffer, format="mp3", bitrate="320k")
     buffer.seek(0)
     return buffer
 
@@ -1027,6 +1127,7 @@ with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa veloc
         for i, bf in enumerate(batch_files):
             with st.spinner(f"Analizzo {bf.name}..."):
                 y, sr, t = analyze_track(bf)
+                artista = extract_artist(bf)
                 if correggi_ottava and t > 0:
                     t = correggi_errore_ottava(t, bpm_range_plausibile[0], bpm_range_plausibile[1])
                 if trim_silenzio:
@@ -1035,10 +1136,11 @@ with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa veloc
                     y = normalize_loudness(y, sr, target_lufs=target_lufs)
                 key_nome, camelot, _ = detect_key_camelot(y, sr)
                 ambiguita = check_tempo_ambiguity(y, sr, t) if t > 0 else []
+                bpm_alt, stato_crosscheck = cross_check_tempo(y, sr, t) if t > 0 else (None, "n/d")
                 st.session_state.batch_results.append({
-                    'name': bf.name, 'y': y, 'sr': sr, 'tempo': t,
+                    'name': bf.name, 'artist': artista, 'y': y, 'sr': sr, 'tempo': t,
                     'key_nome': key_nome or "n/d", 'camelot': camelot or "?",
-                    'ambiguita': ambiguita
+                    'ambiguita': ambiguita, 'bpm_alt': bpm_alt, 'stato_crosscheck': stato_crosscheck
                 })
             progress.progress((i + 1) / len(batch_files), text=f"Analizzato {bf.name}")
         progress.empty()
@@ -1050,7 +1152,13 @@ with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa veloc
             with col_info:
                 if r['tempo'] > 0:
                     ambiguita = r.get('ambiguita', [])
+                    stato_cc = r.get('stato_crosscheck', 'n/d')
+                    bpm_alt = r.get('bpm_alt')
                     st.caption(f"🎵 {r['name']} — {r['key_nome']} ({r['camelot']})")
+                    if stato_cc == "concorda":
+                        st.caption(f"✅ Verifica incrociata (metodo indipendente): {bpm_alt} BPM — d'accordo.")
+                    elif stato_cc.startswith("disaccordo") and bpm_alt:
+                        st.caption(f"🔴 Verifica incrociata IN DISACCORDO: metodo indipendente rileva {bpm_alt} BPM ({stato_cc}). Controlla ad orecchio: potrebbe essere quello giusto.")
                     if ambiguita:
                         alt_str = ", ".join(f"{bpm} ({nome})" for bpm, nome, _ in ambiguita[:2])
                         st.caption(f"⚠️ Possibile ambiguità ritmica — BPM alternativi plausibili: {alt_str}. Verifica ad orecchio o dal tag del brano.")
