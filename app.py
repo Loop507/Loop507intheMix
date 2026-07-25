@@ -27,6 +27,24 @@ except ImportError:
     # crashare tutta l'app. Se vedi questo messaggio, aggiungi 'mido' a requirements.txt.
     MIDI_DISPONIBILE = False
 
+try:
+    import pyloudnorm as pyln
+    LOUDNORM_DISPONIBILE = True
+except ImportError:
+    # pyloudnorm non e' nei requirements: la normalizzazione LUFS si disattiva da sola.
+    # Se vedi questo messaggio, aggiungi 'pyloudnorm' a requirements.txt.
+    LOUDNORM_DISPONIBILE = False
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # backend headless: niente display, necessario su server tipo Streamlit Cloud
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_DISPONIBILE = True
+except ImportError:
+    # matplotlib non e' nei requirements: l'export dell'immagine onda si disattiva da sola.
+    # Se vedi questo messaggio, aggiungi 'matplotlib' a requirements.txt.
+    MATPLOTLIB_DISPONIBILE = False
+
 # --- Configurazione FFmpeg ---
 ffmpeg_bin = shutil.which("ffmpeg")
 if ffmpeg_bin:
@@ -783,12 +801,96 @@ def estimate_memory_mb(y):
     return y.nbytes / (1024 * 1024)
 
 
+# --- Preparazione audio: loudness, trim, provino veloce, immagine finale ------------------
+def normalize_loudness(y, sr, target_lufs=-18.0):
+    """Normalizza un deck stereo (2, n) a un target LUFS comune (standard ITU-R BS.1770-4,
+    via pyloudnorm), cosi' deck mixati a volumi molto diversi non falsano più il bilanciamento
+    reale in DJ Remix/Hyper-Mixer. Se la misura non è affidabile (audio troppo corto, o
+    silenzio/quasi-silenzio dove il guadagno esploderebbe) restituisce l'audio invariato
+    invece di rischiare un risultato assurdo."""
+    if not LOUDNORM_DISPONIBILE or y.shape[1] == 0:
+        return y
+    try:
+        meter = pyln.Meter(sr)
+        current_lufs = meter.integrated_loudness(y.T)  # pyloudnorm vuole (n_campioni, canali)
+        if not np.isfinite(current_lufs) or current_lufs < -60:
+            return y  # silenzio o misura inaffidabile: non normalizzo
+        normalized = pyln.normalize.loudness(y.T, current_lufs, target_lufs).T
+        # pyloudnorm può amplificare oltre 0dBFS in casi estremi (deck originariamente molto
+        # silenzioso): clip di sicurezza per non introdurre distorsione digitale.
+        max_val = np.max(np.abs(normalized))
+        if max_val > 1.0:
+            normalized = normalized / max_val
+        return normalized
+    except Exception:
+        return y
+
+
+def trim_silence_stereo(y, top_db=40):
+    """Rimuove il silenzio (sotto top_db) da inizio e fine di un deck stereo (2, n), usando
+    l'energia combinata dei due canali per decidere i punti di taglio, poi applicando lo
+    STESSO taglio a entrambi (cosi' L/R restano sincronizzati). Utile soprattutto per il
+    deck leader in DJ Remix: senza trim, silenzio in testa/coda è 'spazio morto' dove un
+    overlay può finire piazzato inutilmente."""
+    if y.shape[1] == 0:
+        return y
+    try:
+        y_mono = np.mean(np.abs(y), axis=0)
+        _, index = librosa.effects.trim(y_mono, top_db=top_db)
+        if index[1] <= index[0]:
+            return y  # trim risultato vuoto/invertito: non rischio di azzerare il deck
+        return y[:, index[0]:index[1]]
+    except Exception:
+        return y
+
+
+def build_waveform_image(final_y, sr, events=None, title="Loop507 Mix"):
+    """Genera un'immagine PNG della forma d'onda del mix finale, con marcatori colorati per
+    deck nei punti dove sono stati piazzati taglio/overlay (stessi 'events' già usati per il
+    MIDI) — una 'foto' di cosa è successo nel mix, utile a documentare/capire il risultato
+    anche senza riascoltarlo per intero."""
+    if not MATPLOTLIB_DISPONIBILE or final_y.shape[1] == 0:
+        return None
+    try:
+        fig, ax = plt.subplots(figsize=(12, 3), dpi=110)
+        mono = np.mean(final_y, axis=0)
+        step = max(1, len(mono) // 6000)  # downsample: non serve plottare ogni singolo campione
+        tempo_asse = np.arange(0, len(mono), step) / sr
+        ax.plot(tempo_asse, mono[::step], color="#2b2b2b", linewidth=0.6)
+        ax.fill_between(tempo_asse, mono[::step], 0, color="#2b2b2b", alpha=0.15)
+        ax.set_xlim(0, max(len(mono) / sr, 0.01))
+        ax.set_facecolor("#f7f7f5")
+        ax.set_xlabel("Tempo (s)")
+        ax.set_yticks([])
+        ax.set_title(title, fontsize=11)
+
+        if events:
+            deck_lettere = sorted({d for _, d in events})
+            cmap = plt.get_cmap("tab10")
+            deck_colori = {d: cmap(i % 10) for i, d in enumerate(deck_lettere)}
+            for start_sample, deck in events:
+                ax.axvline(start_sample / sr, color=deck_colori[deck], alpha=0.55, linewidth=1.1)
+            # Legenda manuale: una linea per ogni deck coinvolto
+            handles = [plt.Line2D([0], [0], color=deck_colori[d], label=f"Deck {d.upper()}") for d in deck_lettere]
+            ax.legend(handles=handles, loc="upper right", fontsize=7, ncol=min(len(handles), 8), framealpha=0.8)
+
+        buffer = BytesIO()
+        fig.savefig(buffer, format="png", bbox_inches="tight")
+        plt.close(fig)
+        buffer.seek(0)
+        return buffer
+    except Exception:
+        return None
+
+
 def invalidate_mix():
     """Invalida il mix precedente quando i segmenti cambiano (fix bug #4)."""
     st.session_state.pop("mix_ready", None)
     st.session_state.pop("mix_preset", None)
     st.session_state.pop("mix_events", None)
     st.session_state.pop("dj_rendered_by_deck", None)
+    st.session_state.pop("mix_is_preview", None)
+    st.session_state.pop("mix_waveform_image", None)
     st.session_state.audio_report = ""
 
 
@@ -828,6 +930,28 @@ bpm_range_plausibile = st.sidebar.slider(
     "Range BPM plausibile:", 40, 220, (70, 180), disabled=not correggi_ottava
 )
 
+st.sidebar.header("🎚️ Preparazione Audio")
+normalizza_loudness = st.sidebar.checkbox(
+    "Normalizza Loudness (LUFS)", value=False,
+    help="Porta tutti i deck allo stesso volume percepito (standard ITU-R BS.1770-4, via "
+         "pyloudnorm) prima di usarli. Senza questo, deck masterizzati a volumi molto diversi "
+         "rendono impreciso qualunque bilanciamento (es. overlay_gain in DJ Remix)."
+)
+target_lufs = st.sidebar.slider(
+    "Target LUFS:", -30.0, -6.0, -18.0, step=0.5, disabled=not normalizza_loudness,
+    help="-18 LUFS è un target comune per musica non da streaming. Valori più alti (es. -12) = più forte."
+)
+trim_silenzio = st.sidebar.checkbox(
+    "Taglia silenzio in testa/coda", value=False,
+    help="Rimuove il silenzio all'inizio e alla fine di ogni deck. Utile soprattutto per il "
+         "deck leader in DJ Remix: senza questo, il silenzio è 'spazio morto' dove un overlay "
+         "può finire piazzato inutilmente."
+)
+trim_soglia_db = st.sidebar.slider(
+    "Soglia silenzio (dB sotto il picco):", 20, 60, 40, disabled=not trim_silenzio,
+    help="Più alto = considera silenzio anche suoni non proprio a zero (taglio più aggressivo)."
+)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 📦 BATCH BPM MATCHER — tool separato e indipendente dall'Hyper-Mixer.
 # Usa lo stesso session_state prefix "batch_" per non toccare in alcun modo lo
@@ -860,6 +984,10 @@ with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa veloc
                 y, sr, t = analyze_track(bf)
                 if correggi_ottava and t > 0:
                     t = correggi_errore_ottava(t, bpm_range_plausibile[0], bpm_range_plausibile[1])
+                if trim_silenzio:
+                    y = trim_silence_stereo(y, top_db=trim_soglia_db)
+                if normalizza_loudness:
+                    y = normalize_loudness(y, sr, target_lufs=target_lufs)
                 key_nome, camelot, _ = detect_key_camelot(y, sr)
                 st.session_state.batch_results.append({
                     'name': bf.name, 'y': y, 'sr': sr, 'tempo': t,
@@ -937,6 +1065,14 @@ for row_idx in [0, 4]:
                         y, sr, t = analyze_track(up)
                         if correggi_ottava and t > 0:
                             t = correggi_errore_ottava(t, bpm_range_plausibile[0], bpm_range_plausibile[1])
+                        if trim_silenzio:
+                            # Prima del trim, DOPO l'analisi BPM: tagliare il silenzio non
+                            # altera il tempo del contenuto reale, solo lo 'spazio morto' attorno.
+                            y = trim_silence_stereo(y, top_db=trim_soglia_db)
+                        if normalizza_loudness:
+                            # Normalizzo DOPO il trim: cosi' il silenzio tagliato non influenza
+                            # la misura di loudness del contenuto reale.
+                            y = normalize_loudness(y, sr, target_lufs=target_lufs)
                         st.session_state.decks[k] = {
                             'y': y, 'sr': sr, 'tempo': t, 'tempo_detected': t, 'name': up.name
                         }
@@ -1418,6 +1554,13 @@ if active_decks:
                  "salvato nel preset scaricabile, così puoi ritrovare un mix riuscito per caso."
         )
 
+        modalita_anteprima = st.sidebar.checkbox(
+            "⚡ Modalità Anteprima (genera solo ~15s, veloce)", value=False,
+            help="Utile per sentire rapidamente l'effetto dei parametri correnti prima di "
+                 "generare il mix completo, che con molti eventi/deck può richiedere più tempo. "
+                 "Disattiva per generare la versione finale a durata piena."
+        )
+
         if not apply_dj_remix:
             durata_mix = st.sidebar.number_input("Durata Mix Finale (sec):", 10, 600, 60)
         else:
@@ -1501,9 +1644,22 @@ if active_decks:
                                 for s in overlay_pool:
                                     s['onset_offset'] = find_strongest_onset_offset(s['audio'], ref_sr)
 
+                        # In modalità anteprima: uso solo i primi ~15s del leader e riduco gli
+                        # eventi proporzionalmente, riusando IDENTICA la logica di generazione
+                        # (build_dj_remix_overlay gestisce già correttamente buffer di qualunque
+                        # lunghezza), invece di duplicare il codice per un percorso "veloce" a parte.
+                        if modalita_anteprima:
+                            anteprima_samples = int(15 * ref_sr)
+                            leader_y_per_generazione = dj_leader_d['y'][:, :anteprima_samples]
+                            frazione = leader_y_per_generazione.shape[1] / max(1, dj_leader_d['y'].shape[1])
+                            num_eventi_effettivi = max(3, int(num_overlay_events * frazione))
+                        else:
+                            leader_y_per_generazione = dj_leader_d['y']
+                            num_eventi_effettivi = num_overlay_events
+
                         with st.spinner("Sovrappongo i frammenti (DJ Remix)..."):
                             final_y, eventi_piazzati, dj_events = build_dj_remix_overlay(
-                                dj_leader_d['y'], ref_sr, overlay_pool, overlay_gain, num_overlay_events,
+                                leader_y_per_generazione, ref_sr, overlay_pool, overlay_gain, num_eventi_effettivi,
                                 rng, deck_weights, beatmatch=dj_beatmatch,
                                 phrase_beats=dj_beats_per_phrase if dj_phrase_match else None,
                                 bass_cutoff_hz=dj_bass_cutoff if dj_bass_swap else None,
@@ -1543,7 +1699,7 @@ if active_decks:
 
                     chosen = []
                     curr_samples = 0
-                    target_samples = durata_mix * ref_sr
+                    target_samples = (15 if modalita_anteprima else durata_mix) * ref_sr
                     dj_events = []  # riuso lo stesso nome del ramo DJ Remix per il MIDI
 
                     # Peso effettivo per segmento: peso_deck diviso per quanti segmenti quel deck
@@ -1709,12 +1865,21 @@ if active_decks:
 #AudioDecomposition #NoiseArt #SignalCorruption #RecursiveCollapse
 """
                     st.session_state.mix_ready = out
+                    st.session_state.mix_is_preview = modalita_anteprima
+
+                    # --- Immagine forma d'onda: 'foto' di cosa è successo nel mix ---
+                    titolo_img = f"Loop507 {'DJ Remix' if apply_dj_remix else 'Hyper-Mixer'}" + (" — ANTEPRIMA" if modalita_anteprima else "")
+                    st.session_state.mix_waveform_image = build_waveform_image(final_y, ref_sr, dj_events, title=titolo_img)
 
 if st.session_state.get('mix_ready'):
     st.divider()
     st.subheader("🎵 Risultato del Mix")
+    if st.session_state.get('mix_is_preview'):
+        st.warning("⚡ Questa è un'ANTEPRIMA veloce (~15s) — disattiva 'Modalità Anteprima' e rigenera per il mix completo.")
     st.audio(st.session_state.mix_ready)
-    col_d1, col_d2, col_d3, col_d4 = st.columns(4)
+    if st.session_state.get('mix_waveform_image'):
+        st.image(st.session_state.mix_waveform_image, use_container_width=True)
+    col_d1, col_d2, col_d3, col_d4, col_d5 = st.columns(5)
     with col_d1:
         st.download_button("📥 Scarica Mix MP3", st.session_state.mix_ready, "loop507_custom_mix.mp3", use_container_width=True)
     with col_d2:
@@ -1743,6 +1908,15 @@ if st.session_state.get('mix_ready'):
                 st.caption("🎹 Nessuna struttura MIDI disponibile per questo mix.")
         else:
             st.caption("🎹 Export MIDI non disponibile: aggiungi 'mido' a requirements.txt.")
+    with col_d5:
+        if st.session_state.get('mix_waveform_image'):
+            st.download_button(
+                "🖼️ Scarica Immagine Onda", st.session_state.mix_waveform_image,
+                "loop507_waveform.png", mime="image/png", use_container_width=True,
+                help="Forma d'onda del mix con marcatori colorati per deck nei punti di taglio/overlay."
+            )
+        else:
+            st.caption("🖼️ Immagine onda non disponibile: aggiungi 'matplotlib' a requirements.txt.")
 
 st.markdown("---")
-st.caption("Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva | Stereo + DJ Remix + Tecniche DJ Avanzate + LR4 v5.4")
+st.caption("Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva | Stereo + DJ Remix + Preparazione Audio + Waveform v5.5")
