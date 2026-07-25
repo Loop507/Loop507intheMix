@@ -6,3 +6,4 @@ mido
 scipy
 pyloudnorm
 matplotlib
+mutagen
