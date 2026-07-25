@@ -3,3 +3,6 @@ librosa
 pydub
 numpy
 mido
+scipy
+pyloudnorm
+matplotlib
