@@ -100,6 +100,51 @@ def correggi_errore_ottava(tempo_val, bpm_min, bpm_max):
     return t
 
 
+def check_tempo_ambiguity(y, sr, tempo_val):
+    """Verifica se esistono BPM alternativi plausibili con forza ritmica comparabile a quello
+    rilevato — non solo il classico raddoppio/dimezzamento (2:1), ma anche i rapporti 3:2 e 2:3,
+    tipici di ritmi sincopati/shuffle che possono ingannare il beat-tracker facendogli agganciare
+    una sottodivisione sbagliata (es. rileva 92 invece di 138 BPM, rapporto 3:2, non 2:1 — quindi
+    la correzione ottava classica non lo intercetta). Confronta l'autocorrelazione dell'onset
+    envelope al periodo del BPM rilevato contro quella ai periodi candidati alternativi: se un
+    alternativo ha una forza comparabile o superiore, lo segnala come possibile ambiguità, senza
+    correggerlo automaticamente — qui la decisione finale spetta a un orecchio umano (o ad una
+    lettura del BPM dal tag ID3 del brano), non a un'euristica cieca."""
+    if tempo_val is None or tempo_val <= 0:
+        return []
+    try:
+        y_mono = np.mean(y, axis=0) if y.ndim == 2 else y
+        onset_env = librosa.onset.onset_strength(y=y_mono, sr=sr)
+        if len(onset_env) < 16:
+            return []
+        ac = librosa.autocorrelate(onset_env, max_size=len(onset_env))
+        hop_length = 512  # default di librosa.onset.onset_strength
+        fps = sr / hop_length
+
+        def forza_a_bpm(bpm):
+            if bpm <= 0:
+                return 0.0
+            periodo_frame = int(round(fps * 60.0 / bpm))
+            if periodo_frame <= 0 or periodo_frame >= len(ac):
+                return 0.0
+            return float(ac[periodo_frame])
+
+        forza_primaria = forza_a_bpm(tempo_val)
+        if forza_primaria <= 1e-9:
+            return []
+
+        candidati = []
+        for ratio, nome in [(0.5, "metà"), (2.0, "doppio"), (1.5, "3/2"), (2 / 3, "2/3")]:
+            bpm_alt = tempo_val * ratio
+            forza_alt = forza_a_bpm(bpm_alt)
+            if forza_alt >= forza_primaria * 0.85:  # comparabile o più forte del rilevato
+                candidati.append((round(bpm_alt, 1), nome, round(forza_alt / forza_primaria, 2)))
+        candidati.sort(key=lambda c: -c[2])
+        return candidati
+    except Exception:
+        return []
+
+
 # --- Rilevamento tonalità (Krumhansl-Schmuckler) + notazione Camelot ---------------------
 # Profili statistici standard: quanto ogni grado della scala cromatica "suona stabile"
 # in un contesto maggiore/minore (Krumhansl & Kessler, 1982). Sono la base di praticamente
@@ -989,18 +1034,35 @@ with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa veloc
                 if normalizza_loudness:
                     y = normalize_loudness(y, sr, target_lufs=target_lufs)
                 key_nome, camelot, _ = detect_key_camelot(y, sr)
+                ambiguita = check_tempo_ambiguity(y, sr, t) if t > 0 else []
                 st.session_state.batch_results.append({
                     'name': bf.name, 'y': y, 'sr': sr, 'tempo': t,
-                    'key_nome': key_nome or "n/d", 'camelot': camelot or "?"
+                    'key_nome': key_nome or "n/d", 'camelot': camelot or "?",
+                    'ambiguita': ambiguita
                 })
             progress.progress((i + 1) / len(batch_files), text=f"Analizzato {bf.name}")
         progress.empty()
 
     if st.session_state.batch_results:
-        st.write("**Tracce analizzate:**")
-        for r in st.session_state.batch_results:
-            bpm_label = f"{r['tempo']:.1f} BPM" if r['tempo'] > 0 else "BPM non rilevato"
-            st.caption(f"🎵 {r['name']} — {bpm_label} — {r['key_nome']} ({r['camelot']})")
+        st.write("**Tracce analizzate** (correggi il BPM a mano se sai che è sbagliato — la rilevazione automatica non è mai garantita al 100%):")
+        for i, r in enumerate(st.session_state.batch_results):
+            col_info, col_bpm = st.columns([3, 1])
+            with col_info:
+                if r['tempo'] > 0:
+                    ambiguita = r.get('ambiguita', [])
+                    st.caption(f"🎵 {r['name']} — {r['key_nome']} ({r['camelot']})")
+                    if ambiguita:
+                        alt_str = ", ".join(f"{bpm} ({nome})" for bpm, nome, _ in ambiguita[:2])
+                        st.caption(f"⚠️ Possibile ambiguità ritmica — BPM alternativi plausibili: {alt_str}. Verifica ad orecchio o dal tag del brano.")
+                else:
+                    st.caption(f"🎵 {r['name']} — BPM non rilevato — {r['key_nome']} ({r['camelot']})")
+            with col_bpm:
+                nuovo_bpm = st.number_input(
+                    "BPM", min_value=0.0, max_value=300.0,
+                    value=float(r['tempo']) if r['tempo'] > 0 else 120.0,
+                    step=0.1, key=f"batch_bpm_override_{i}", label_visibility="collapsed"
+                )
+                st.session_state.batch_results[i]['tempo'] = nuovo_bpm
 
         tempi_validi = [r['tempo'] for r in st.session_state.batch_results if r['tempo'] > 0]
         if not tempi_validi:
@@ -1010,7 +1072,8 @@ with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa veloc
             target_bpm = st.number_input(
                 "🎯 BPM target per tutte le tracce:", min_value=20.0, max_value=300.0,
                 value=round(mediana_bpm, 1), step=1.0,
-                help=f"Precompilato con la mediana del gruppo ({mediana_bpm:.1f} BPM), modificabile."
+                help=f"Precompilato con la mediana del gruppo ({mediana_bpm:.1f} BPM), modificabile.",
+                key="batch_target_bpm"
             )
 
             if st.button("🚀 Allinea tutte e genera ZIP", key="batch_align_btn"):
