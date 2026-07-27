@@ -7,3 +7,4 @@ scipy
 pyloudnorm
 matplotlib
 mutagen
+aubio
