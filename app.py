@@ -12,6 +12,14 @@ import zipfile
 from datetime import datetime
 
 try:
+    import aubio
+    AUBIO_DISPONIBILE = True
+except ImportError:
+    # aubio non e' nei requirements: il terzo metodo di verifica BPM si disattiva da solo.
+    # Se vedi questo messaggio, aggiungi 'aubio' a requirements.txt.
+    AUBIO_DISPONIBILE = False
+
+try:
     from scipy.signal import butter, sosfiltfilt
     SCIPY_DISPONIBILE = True
 except ImportError:
@@ -153,32 +161,99 @@ def check_tempo_ambiguity(y, sr, tempo_val):
         return []
 
 
-def cross_check_tempo(y, sr, tempo_principale):
-    """Stima il BPM con un secondo metodo indipendente (autocorrelazione del tempogram via
-    librosa.feature.tempo — percorso algoritmico diverso dal beat-tracking dinamico usato per
-    tempo_principale/refine_tempo_from_beats) e confronta i due risultati. Se sono d'accordo
-    (entro il 3%), aumenta la fiducia nel BPM rilevato. Se disaccordano per un rapporto NOTO
-    (metà/doppio/3:2/2:3 — gli stessi tipi di errore di check_tempo_ambiguity, qui verificati
-    da un algoritmo indipendente invece che dallo stesso), lo segnala esplicitamente: è proprio
-    il tipo di caso (es. Neon Pulse: rilevato 92 invece di 138, rapporto 3:2) che un singolo
-    metodo può mancare, ma che si vede chiaramente confrontando due approcci diversi."""
-    if tempo_principale is None or tempo_principale <= 0:
-        return None, "n/d"
+def classifica_rapporto(a, b, tolleranza=0.03):
+    """Classifica il rapporto b/a in una categoria nota: 'uguale', 'metà', 'doppio', '3/2',
+    '2/3', o 'diverso' (nessun rapporto noto)."""
+    if a is None or b is None or a <= 0 or b <= 0:
+        return None
+    rapporto = b / a
+    if abs(rapporto - 1.0) < tolleranza:
+        return "uguale"
+    for r, nome in [(0.5, "metà"), (2.0, "doppio"), (1.5, "3/2"), (2 / 3, "2/3")]:
+        if abs(rapporto - r) < tolleranza:
+            return nome
+    return "diverso"
+
+
+def aubio_tempo_estimate(y, sr):
+    """Stima il BPM con aubio (algoritmo di Paul Brossier: onset detection via High Frequency
+    Content, poi tracking del tempo) — tecnica indipendente sia dal beat-tracking dinamico di
+    librosa (usato per tempo_principale) sia dall'autocorrelazione del tempogram (usata da
+    librosa.feature.tempo). Un terzo parere costruito su un principio di rilevamento diverso
+    dagli altri due tende a sbagliare in modo diverso, il che lo rende utile proprio nei casi
+    in cui i primi due concordano ma sono entrambi vittima dello stesso tipo di errore."""
+    if not AUBIO_DISPONIBILE:
+        return None
     try:
         y_mono = np.mean(y, axis=0) if y.ndim == 2 else y
-        tempo_alt = librosa.feature.tempo(y=y_mono, sr=sr)
-        tempo_alt_val = float(tempo_alt[0]) if hasattr(tempo_alt, '__len__') else float(tempo_alt)
-        if tempo_alt_val <= 0:
-            return None, "n/d"
-        rapporto = tempo_alt_val / tempo_principale
-        if abs(rapporto - 1.0) < 0.03:
-            return round(tempo_alt_val, 1), "concorda"
-        for r, nome in [(0.5, "metà"), (2.0, "doppio"), (1.5, "3/2"), (2 / 3, "2/3")]:
-            if abs(rapporto - r) < 0.03:
-                return round(tempo_alt_val, 1), f"disaccordo ({nome})"
-        return round(tempo_alt_val, 1), "disaccordo"
+        y_mono = np.ascontiguousarray(y_mono.astype(np.float32))
+        win_s, hop_s = 1024, 512
+        if len(y_mono) < win_s * 2:
+            return None
+        tempo_o = aubio.tempo("default", win_s, hop_s, sr)
+        total = 0
+        while total + hop_s <= len(y_mono):
+            tempo_o(y_mono[total:total + hop_s])
+            total += hop_s
+        bpm = float(tempo_o.get_bpm())
+        return bpm if bpm > 0 else None
     except Exception:
-        return None, "n/d"
+        return None
+
+
+def cross_check_tempo(y, sr, tempo_principale):
+    """Confronta il BPM principale (beat-tracking dinamico + mediana intervalli, il nostro
+    metodo di riferimento) con DUE metodi indipendenti aggiuntivi che usano principi di
+    rilevamento diversi tra loro: librosa.feature.tempo (autocorrelazione del tempogram) e
+    aubio (High Frequency Content, algoritmo di Paul Brossier).
+    - Se entrambi concordano col principale: alta fiducia, nessun avviso necessario.
+    - Se ENTRAMBI concordano TRA LORO ma disaccordano dal principale per lo stesso rapporto
+      noto (es. 3:2): è un segnale molto più forte — due metodi indipendenti contro uno solo
+      — che il principale sia sbagliato, rispetto al vecchio confronto a due soli metodi.
+    - Se concordano parzialmente, o nessuno conferma: fiducia intermedia/bassa, segnalata
+      esplicitamente invece di far finta che tutto vada bene.
+    Ritorna un dict con tutti i dettagli (utile sia per la UI che per il report)."""
+    if tempo_principale is None or tempo_principale <= 0:
+        return {"esito": "n/d", "feature_tempo": None, "aubio_tempo": None,
+                "feature_rapporto": None, "aubio_rapporto": None}
+
+    try:
+        y_mono = np.mean(y, axis=0) if y.ndim == 2 else y
+        tempo_feature_raw = librosa.feature.tempo(y=y_mono, sr=sr)
+        tempo_feature = float(tempo_feature_raw[0]) if hasattr(tempo_feature_raw, '__len__') else float(tempo_feature_raw)
+        if tempo_feature <= 0:
+            tempo_feature = None
+    except Exception:
+        tempo_feature = None
+
+    tempo_aubio = aubio_tempo_estimate(y, sr)
+
+    feature_rapporto = classifica_rapporto(tempo_principale, tempo_feature) if tempo_feature else None
+    aubio_rapporto = classifica_rapporto(tempo_principale, tempo_aubio) if tempo_aubio else None
+
+    concordi_col_principale = sum(1 for r in [feature_rapporto, aubio_rapporto] if r == "uguale")
+    stesso_disaccordo = (
+        feature_rapporto and aubio_rapporto
+        and feature_rapporto == aubio_rapporto
+        and feature_rapporto != "uguale"
+    )
+
+    if concordi_col_principale == 2:
+        esito = "confermato (2/2 metodi indipendenti concordano)"
+    elif stesso_disaccordo:
+        esito = f"probabile errore — 2 metodi indipendenti concordano tra loro su un rapporto '{feature_rapporto}' diverso dal principale"
+    elif concordi_col_principale == 1:
+        esito = "parzialmente confermato (1/2 metodi concorda)"
+    else:
+        esito = "nessuna conferma indipendente disponibile"
+
+    return {
+        "esito": esito,
+        "feature_tempo": round(tempo_feature, 1) if tempo_feature else None,
+        "aubio_tempo": round(tempo_aubio, 1) if tempo_aubio else None,
+        "feature_rapporto": feature_rapporto,
+        "aubio_rapporto": aubio_rapporto,
+    }
 
 
 # --- Rilevamento tonalità (Krumhansl-Schmuckler) + notazione Camelot ---------------------
@@ -331,9 +406,13 @@ def build_batch_report(results, order, target_bpm, saltate):
         rate = target_bpm / r['tempo']
         cross_info_it = ""
         cross_info_en = ""
-        if r.get('stato_crosscheck', 'n/d') not in ('n/d', 'concorda'):
-            cross_info_it = f"\n    Verifica incrociata: {r.get('stato_crosscheck')} (metodo alternativo: {r.get('bpm_alt')} BPM) — controlla ad orecchio"
-            cross_info_en = f"\n    Cross-check: {r.get('stato_crosscheck')} (alternative method: {r.get('bpm_alt')} BPM) — verify by ear"
+        cc = r.get('crosscheck', {})
+        esito = cc.get('esito', 'n/d')
+        if esito not in ('n/d', 'confermato (2/2 metodi indipendenti concordano)'):
+            cross_info_it = (f"\n    Verifica incrociata: {esito} "
+                              f"(feature.tempo: {cc.get('feature_tempo')} BPM, aubio: {cc.get('aubio_tempo')} BPM)")
+            cross_info_en = (f"\n    Cross-check: {esito} "
+                              f"(feature.tempo: {cc.get('feature_tempo')} BPM, aubio: {cc.get('aubio_tempo')} BPM)")
         righe_it.append(
             f"* {r['name']}\n"
             f"    Originale: {r['tempo']:.2f} BPM — {r['key_nome']} ({r['camelot']})\n"
@@ -1136,11 +1215,11 @@ with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa veloc
                     y = normalize_loudness(y, sr, target_lufs=target_lufs)
                 key_nome, camelot, _ = detect_key_camelot(y, sr)
                 ambiguita = check_tempo_ambiguity(y, sr, t) if t > 0 else []
-                bpm_alt, stato_crosscheck = cross_check_tempo(y, sr, t) if t > 0 else (None, "n/d")
+                crosscheck = cross_check_tempo(y, sr, t) if t > 0 else {"esito": "n/d", "feature_tempo": None, "aubio_tempo": None}
                 st.session_state.batch_results.append({
                     'name': bf.name, 'artist': artista, 'y': y, 'sr': sr, 'tempo': t,
                     'key_nome': key_nome or "n/d", 'camelot': camelot or "?",
-                    'ambiguita': ambiguita, 'bpm_alt': bpm_alt, 'stato_crosscheck': stato_crosscheck
+                    'ambiguita': ambiguita, 'crosscheck': crosscheck
                 })
             progress.progress((i + 1) / len(batch_files), text=f"Analizzato {bf.name}")
         progress.empty()
@@ -1152,13 +1231,15 @@ with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa veloc
             with col_info:
                 if r['tempo'] > 0:
                     ambiguita = r.get('ambiguita', [])
-                    stato_cc = r.get('stato_crosscheck', 'n/d')
-                    bpm_alt = r.get('bpm_alt')
+                    cc = r.get('crosscheck', {})
+                    esito = cc.get('esito', 'n/d')
                     st.caption(f"🎵 {r['name']} — {r['key_nome']} ({r['camelot']})")
-                    if stato_cc == "concorda":
-                        st.caption(f"✅ Verifica incrociata (metodo indipendente): {bpm_alt} BPM — d'accordo.")
-                    elif stato_cc.startswith("disaccordo") and bpm_alt:
-                        st.caption(f"🔴 Verifica incrociata IN DISACCORDO: metodo indipendente rileva {bpm_alt} BPM ({stato_cc}). Controlla ad orecchio: potrebbe essere quello giusto.")
+                    if esito.startswith("confermato"):
+                        st.caption(f"✅ Verifica incrociata: {esito} (feature.tempo: {cc.get('feature_tempo')}, aubio: {cc.get('aubio_tempo')})")
+                    elif esito.startswith("probabile errore"):
+                        st.caption(f"🔴 {esito.upper()} — feature.tempo: {cc.get('feature_tempo')} BPM, aubio: {cc.get('aubio_tempo')} BPM. Controlla ad orecchio: probabilmente uno di questi due è quello giusto.")
+                    elif esito.startswith("parzialmente"):
+                        st.caption(f"🟡 Verifica incrociata: {esito} (feature.tempo: {cc.get('feature_tempo')}, aubio: {cc.get('aubio_tempo')})")
                     if ambiguita:
                         alt_str = ", ".join(f"{bpm} ({nome})" for bpm, nome, _ in ambiguita[:2])
                         st.caption(f"⚠️ Possibile ambiguità ritmica — BPM alternativi plausibili: {alt_str}. Verifica ad orecchio o dal tag del brano.")
