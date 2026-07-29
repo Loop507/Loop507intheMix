@@ -12,6 +12,14 @@ import zipfile
 from datetime import datetime
 
 try:
+    from audiocomplib import AudioCompressor
+    COMPRESSOR_DISPONIBILE = True
+except ImportError:
+    # audiocomplib non e' nei requirements: la compressione finale si disattiva da sola.
+    # Se vedi questo messaggio, aggiungi 'audiocomplib' a requirements.txt.
+    COMPRESSOR_DISPONIBILE = False
+
+try:
     import aubio
     AUBIO_DISPONIBILE = True
 except ImportError:
@@ -1026,6 +1034,30 @@ def estimate_memory_mb(y):
 
 
 # --- Preparazione audio: loudness, trim, provino veloce, immagine finale ------------------
+def apply_compressor(y, sr, threshold=-15.0, ratio=4.0):
+    """Comprime dinamicamente il mix finale (leader+follower insieme): a differenza della
+    normalizzazione LUFS (che pareggia il volume MEDIO di un intero deck prima di iniziare),
+    il compressore lavora momento per momento — se un singolo overlay ha un picco locale più
+    forte del resto, lo attenua *in quel preciso istante*, anche se il LUFS medio del deck era
+    già a posto. Usa audiocomplib (stereo-linked, soft-knee, niente spostamento dell'immagine
+    stereo). Se il pacchetto non è installato o l'array è troppo corto/degenere, restituisce
+    l'audio invariato invece di rischiare un crash."""
+    if not COMPRESSOR_DISPONIBILE or y.shape[1] == 0:
+        return y
+    try:
+        compressor = AudioCompressor(
+            threshold=threshold, ratio=ratio, attack_time_ms=5.0, release_time_ms=80.0,
+            knee_width=3.0, makeup_gain=0.0
+        )
+        y_input = np.ascontiguousarray(y.astype(np.float32))
+        compressed = compressor.process(y_input, sr)
+        if compressed.shape != y.shape or not np.all(np.isfinite(compressed)):
+            return y  # risultato inatteso: meglio l'originale che un mix rotto
+        return compressed.astype(np.float64)
+    except Exception:
+        return y
+
+
 def normalize_loudness(y, sr, target_lufs=-18.0):
     """Normalizza un deck stereo (2, n) a un target LUFS comune (standard ITU-R BS.1770-4,
     via pyloudnorm), cosi' deck mixati a volumi molto diversi non falsano più il bilanciamento
@@ -1800,6 +1832,19 @@ if active_decks:
         )
         crossfade_ms = st.sidebar.slider("Durata crossfade (ms)", 1, 100, 15, disabled=not apply_crossfade or apply_dj_remix) if apply_crossfade and not apply_dj_remix else 0
 
+        apply_compressione = st.sidebar.checkbox(
+            "🎚️ Compressione dinamica finale (leader+follower più bilanciati)", value=False,
+            help="A differenza della normalizzazione LUFS (pareggia il volume MEDIO di un "
+                 "deck intero prima di iniziare), questa comprime il MIX FINALE momento per "
+                 "momento: se un overlay ha un picco locale più forte del resto, lo attenua "
+                 "in quel preciso istante. Utile quando leader e follower restano sbilanciati "
+                 "anche dopo la normalizzazione LUFS."
+        )
+        compressione_soglia, compressione_ratio = -15.0, 4.0
+        if apply_compressione:
+            compressione_soglia = st.sidebar.slider("Soglia compressione (dB):", -30.0, -5.0, -15.0, step=1.0)
+            compressione_ratio = st.sidebar.slider("Rapporto (ratio):", 1.5, 8.0, 4.0, step=0.5)
+
         seed_input = st.sidebar.number_input(
             "🎲 Seed (0 = casuale ogni volta)", min_value=0, value=0, step=1,
             help="Imposta un numero per rendere il mix riproducibile. Il seed usato viene "
@@ -1991,6 +2036,9 @@ if active_decks:
                 if not chosen:
                     st.sidebar.error("Impossibile generare il mix: nessun segmento valido disponibile.")
                 else:
+                    if apply_compressione:
+                        with st.spinner("Comprimo il mix finale..."):
+                            final_y = apply_compressor(final_y, ref_sr, threshold=compressione_soglia, ratio=compressione_ratio)
                     out = export_audio(final_y, ref_sr)
                     durata_effettiva = final_y.shape[1] / ref_sr
 
@@ -2059,13 +2107,13 @@ if active_decks:
                         sperimentale_info_en = f" / {' / '.join(sperimentale_bits_en)}" if sperimentale_bits_en else ""
                         processo_it = f"DJ Remix: Deck {dj_leader_key.upper()} intatto come base / {eventi_piazzati} overlay sparsi (seed {seed_used}){allineamento_info}{beatmatch_info}{sperimentale_info_it} / Stereo Preservato"
                         processo_en = f"DJ Remix: Deck {dj_leader_key.upper()} kept intact as base / {eventi_piazzati} scattered overlays (seed {seed_used}){sperimentale_info_en} / Stereo Preserved"
-                        extra_it = f"* Deck Base (intatto): {dj_leader_key.upper()}\n* Overlay Piazzati: {eventi_piazzati} (volume {overlay_gain:.2f}x)\n* Allineamento BPM: {'attivo' if dj_bpm_align else 'disattivo'}\n* Beatmatching: {'attivo' if dj_beatmatch else 'disattivo'}\n* Aggancio a frasi: {f'{dj_beats_per_phrase} battute' if dj_phrase_match else 'disattivo'}\n* EQ Bass Swap: {f'sotto {dj_bass_cutoff}Hz' if dj_bass_swap else 'disattivo'}"
-                        extra_en = f"* Base Deck (intact): {dj_leader_key.upper()}\n* Overlays Placed: {eventi_piazzati} (gain {overlay_gain:.2f}x)\n* BPM Alignment: {'on' if dj_bpm_align else 'off'}\n* Beatmatching: {'on' if dj_beatmatch else 'off'}\n* Phrase Matching: {f'{dj_beats_per_phrase} beats' if dj_phrase_match else 'off'}\n* EQ Bass Swap: {f'below {dj_bass_cutoff}Hz' if dj_bass_swap else 'off'}"
+                        extra_it = f"* Deck Base (intatto): {dj_leader_key.upper()}\n* Overlay Piazzati: {eventi_piazzati} (volume {overlay_gain:.2f}x)\n* Allineamento BPM: {'attivo' if dj_bpm_align else 'disattivo'}\n* Beatmatching: {'attivo' if dj_beatmatch else 'disattivo'}\n* Aggancio a frasi: {f'{dj_beats_per_phrase} battute' if dj_phrase_match else 'disattivo'}\n* EQ Bass Swap: {f'sotto {dj_bass_cutoff}Hz' if dj_bass_swap else 'disattivo'}\n* Compressione Finale: {f'soglia {compressione_soglia}dB, ratio {compressione_ratio}' if apply_compressione else 'disattivata'}"
+                        extra_en = f"* Base Deck (intact): {dj_leader_key.upper()}\n* Overlays Placed: {eventi_piazzati} (gain {overlay_gain:.2f}x)\n* BPM Alignment: {'on' if dj_bpm_align else 'off'}\n* Beatmatching: {'on' if dj_beatmatch else 'off'}\n* Phrase Matching: {f'{dj_beats_per_phrase} beats' if dj_phrase_match else 'off'}\n* EQ Bass Swap: {f'below {dj_bass_cutoff}Hz' if dj_bass_swap else 'off'}\n* Final Compression: {f'threshold {compressione_soglia}dB, ratio {compressione_ratio}' if apply_compressione else 'disabled'}"
                     else:
                         processo_it = f"Shuffling Ricorsivo (seed {seed_used}) / Cross-Deck Fragmentation / Sample Rate Uniformato / Stereo Preservato / Pesi Deck Personalizzati"
                         processo_en = f"Recursive Shuffling (seed {seed_used}) / Cross-Deck Fragmentation / Uniform Sample Rate / Stereo Preserved / Custom Deck Weights"
-                        extra_it = f"* Crossfade: {f'{crossfade_ms}ms' if apply_crossfade else 'disattivato'}"
-                        extra_en = f"* Crossfade: {f'{crossfade_ms}ms' if apply_crossfade else 'disabled'}"
+                        extra_it = f"* Crossfade: {f'{crossfade_ms}ms' if apply_crossfade else 'disattivato'}\n* Compressione Finale: {f'soglia {compressione_soglia}dB, ratio {compressione_ratio}' if apply_compressione else 'disattivata'}"
+                        extra_en = f"* Crossfade: {f'{crossfade_ms}ms' if apply_crossfade else 'disabled'}\n* Final Compression: {f'threshold {compressione_soglia}dB, ratio {compressione_ratio}' if apply_compressione else 'disabled'}"
 
                     st.session_state.audio_report = f"""
 ╔════════════════════════════════════════════════════════════════╗
