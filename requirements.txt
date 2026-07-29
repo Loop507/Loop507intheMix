@@ -8,3 +8,4 @@ pyloudnorm
 matplotlib
 mutagen
 aubio
+audiocomplib
