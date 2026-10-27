@@ -83,6 +83,10 @@ TARGET_SR = 44100
 MIN_SEGMENT_SAMPLES = 256          # ~5ms a 44.1kHz, evita segmenti a lunghezza 0
 MAX_SEGMENT_SECONDS = 30           # tetto di sicurezza per singolo segmento
 
+# Versione unica dell'app: usata in preset, report e footer (prima era sparsa in 3 punti con valori diversi)
+APP_VERSION = "5.7"
+DOWNBEAT_MIN_CONFIDENCE = 0.15  # sotto questa confidenza la stima del downbeat viene scartata
+
 # --- Funzioni di Analisi e Taglio ---
 # NOTA STEREO: da qui in poi ogni array audio 'y' ha shape (2, n_samples) -> [canale L, canale R].
 # I brani mono vengono duplicati sui due canali in fase di analisi, cosi' tutta la pipeline
@@ -141,20 +145,33 @@ def check_tempo_ambiguity(y, sr, tempo_val):
         onset_env = librosa.onset.onset_strength(y=y_mono, sr=sr)
         if len(onset_env) < 16:
             return []
-        ac = librosa.autocorrelate(onset_env, max_size=len(onset_env))
+        # Tolgo la media PRIMA di autocorrelare: onset_strength e' sempre >= 0, quindi
+        # l'autocorrelazione grezza ha un grosso offset costante (DC) presente a OGNI lag. Quel
+        # piedistallo avvicina a 1 il rapporto tra forza alternativa e primaria e faceva scattare
+        # molti falsi "possibile ambiguità". Normalizzo anche per ac[0] (energia), cosi' i valori
+        # sono confrontabili (1.0 = perfettamente periodico a quel lag).
+        oenv = onset_env - np.mean(onset_env)
+        ac = librosa.autocorrelate(oenv, max_size=len(oenv))
+        if ac[0] <= 1e-9:
+            return []
+        ac = ac / ac[0]
         hop_length = 512  # default di librosa.onset.onset_strength
         fps = sr / hop_length
 
         def forza_a_bpm(bpm):
             if bpm <= 0:
                 return 0.0
-            periodo_frame = int(round(fps * 60.0 / bpm))
-            if periodo_frame <= 0 or periodo_frame >= len(ac):
+            # Picco entro ±3% del periodo teorico: arrotondare a UN solo frame (circa 2% di errore
+            # a 120 BPM) rischiava di campionare di lato al picco vero e sottostimarne la forza.
+            periodo = fps * 60.0 / bpm
+            lo = max(1, int(np.floor(periodo * 0.97)))
+            hi = min(len(ac) - 1, int(np.ceil(periodo * 1.03)))
+            if lo > hi:
                 return 0.0
-            return float(ac[periodo_frame])
+            return float(np.max(ac[lo:hi + 1]))
 
         forza_primaria = forza_a_bpm(tempo_val)
-        if forza_primaria <= 1e-9:
+        if forza_primaria < 0.1:
             return []
 
         candidati = []
@@ -270,6 +287,24 @@ def cross_check_tempo(y, sr, tempo_principale):
 # ogni key-detector open source basato su librosa (music-key-finder, pyKeyFinder, ecc.).
 _KS_MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
 _KS_MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+# Profili tarati su musica popolare/elettronica (Shaath) e ricavati da un corpus di EDM
+# (Faraldo et al., "Key Estimation in Electronic Dance Music", ECIR 2016; "A Multi-Profile Method
+# for Key Estimation in EDM", AES 2017). I valori sono quelli pubblicati nel sorgente di Essentia
+# (MTG/essentia, algoritmo Key, profili 'shaath' e 'edma'). I profili di Krumhansl derivano da
+# esperimenti di percezione su musica classica occidentale: su house/techno/pop sbagliano piu'
+# spesso, soprattutto sui brani in minore.
+_SHAATH_MAJOR_PROFILE = np.array([6.6, 2.0, 3.5, 2.3, 4.6, 4.0, 2.5, 5.2, 2.4, 3.7, 2.3, 3.4])
+_SHAATH_MINOR_PROFILE = np.array([6.5, 2.7, 3.5, 5.4, 2.6, 3.5, 2.5, 5.2, 4.0, 2.7, 4.3, 3.2])
+_EDMA_MAJOR_PROFILE = np.array([1.00, 0.29, 0.50, 0.40, 0.60, 0.56, 0.32, 0.80, 0.31, 0.45, 0.42, 0.39])
+_EDMA_MINOR_PROFILE = np.array([1.00, 0.31, 0.44, 0.58, 0.33, 0.49, 0.29, 0.78, 0.43, 0.29, 0.53, 0.32])
+# Il punteggio finale di ogni tonalità e' la MEDIA delle correlazioni sui tre set di profili:
+# un solo set tende a sbagliare in modo sistematico, tre set indipendenti si compensano.
+_KEY_PROFILE_SETS = (
+    (_KS_MAJOR_PROFILE, _KS_MINOR_PROFILE),
+    (_SHAATH_MAJOR_PROFILE, _SHAATH_MINOR_PROFILE),
+    (_EDMA_MAJOR_PROFILE, _EDMA_MINOR_PROFILE),
+)
+KEY_ANALYSIS_SECONDS = 90  # il key detection usa un estratto centrale: la tonalità non cambia e costa meno
 _PITCH_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
 # Notazione Camelot: numero+lettera per ogni tonalità maggiore (B) e minore (A).
@@ -281,29 +316,59 @@ _CAMELOT_MINOR = {'Ab': '1A', 'Eb': '2A', 'Bb': '3A', 'F': '4A', 'C': '5A', 'G':
 _ENHARMONIC = {'C#': 'Db', 'D#': 'Eb', 'G#': 'Ab', 'A#': 'Bb'}  # per pescare dalle tabelle sopra
 
 
+def _correlazioni_tonalita(chroma_media):
+    """Correlazione di Pearson tra il chroma medio e i profili di ogni tonalità, mediata sui
+    set di _KEY_PROFILE_SETS. Ritorna un array (12, 2): [semitono_tonica, 0=maggiore/1=minore]."""
+    x = chroma_media - np.mean(chroma_media)
+    nx = np.linalg.norm(x)
+    out = np.zeros((12, 2))
+    if nx <= 1e-12:
+        return out
+    for profili in _KEY_PROFILE_SETS:
+        for modo, profilo in enumerate(profili):
+            for shift in range(12):
+                p = np.roll(profilo, shift)
+                p = p - np.mean(p)
+                out[shift, modo] += float(np.dot(x, p) / (nx * np.linalg.norm(p) + 1e-12))
+    return out / len(_KEY_PROFILE_SETS)
+
+
 def detect_key_camelot(y, sr):
-    """Rileva la tonalità (es. 'A minor') e il codice Camelot corrispondente (es. '8A'),
-    usando le chroma features di librosa correlate ai profili Krumhansl-Schmuckler. Stessa
-    tecnica di pyKeyFinder/music-key-finder: nessuna libreria nuova, solo librosa+numpy che
-    abbiamo già. Ritorna (nome_tonalita, codice_camelot, confidenza) — confidenza bassa
-    (< ~0.15 di scarto tra 1° e 2° risultato) segnala un brano tonalmente ambiguo."""
+    """Rileva la tonalità (es. 'A minor') e il codice Camelot corrispondente (es. '8A').
+    Pipeline (ispirata ai pre-processing di Faraldo et al. per l'EDM, solo DSP, niente ML):
+    1) estratto centrale di KEY_ANALYSIS_SECONDS secondi, 2) componente ARMONICA (HPSS): kick,
+    hi-hat e rullanti sporcano il chroma e non portano informazione tonale, 3) stima
+    dell'intonazione del brano (tuning) e chroma CQT corretto di conseguenza: un brano
+    accordato a 432Hz o con pitch-shift sposta l'energia tra due semitoni e inganna i profili,
+    4) correlazione con tre set di profili (Krumhansl, Shaath, EDMA) e media.
+    Ritorna (nome_tonalita, codice_camelot, confidenza) — confidenza bassa (< ~0.15 di scarto
+    tra 1° e 2° risultato) segnala un brano tonalmente ambiguo."""
     y_mono = np.mean(y, axis=0)
+    max_n = int(KEY_ANALYSIS_SECONDS * sr)
+    if len(y_mono) > max_n:
+        a = (len(y_mono) - max_n) // 2
+        y_mono = y_mono[a:a + max_n]
     try:
-        chroma = librosa.feature.chroma_cqt(y=y_mono, sr=sr)
+        y_arm = librosa.effects.harmonic(y_mono)
+        # Se la componente armonica e' praticamente vuota (brano solo percussivo) uso l'originale
+        if float(np.sum(np.abs(y_arm))) < 1e-3 * float(np.sum(np.abs(y_mono)) + 1e-12):
+            y_arm = y_mono
+        try:
+            tuning = float(librosa.estimate_tuning(y=y_arm, sr=sr))
+        except Exception:
+            tuning = 0.0
+        chroma = librosa.feature.chroma_cqt(y=y_arm, sr=sr, tuning=tuning)
     except Exception:
         return None, None, 0.0
     mean_chroma = np.mean(chroma, axis=1)
     if np.sum(mean_chroma) <= 0:
         return None, None, 0.0
 
+    corr = _correlazioni_tonalita(mean_chroma)
     scores = []
     for shift in range(12):
-        major_profile = np.roll(_KS_MAJOR_PROFILE, shift)
-        minor_profile = np.roll(_KS_MINOR_PROFILE, shift)
-        corr_major = np.corrcoef(mean_chroma, major_profile)[0, 1]
-        corr_minor = np.corrcoef(mean_chroma, minor_profile)[0, 1]
-        scores.append((corr_major, _PITCH_NAMES[shift], 'major'))
-        scores.append((corr_minor, _PITCH_NAMES[shift], 'minor'))
+        scores.append((corr[shift, 0], _PITCH_NAMES[shift], 'major'))
+        scores.append((corr[shift, 1], _PITCH_NAMES[shift], 'minor'))
 
     scores.sort(key=lambda s: (s[0] if not np.isnan(s[0]) else -1), reverse=True)
     best_score, best_pitch, best_mode = scores[0]
@@ -508,36 +573,36 @@ def suggest_camelot_order(results):
 
 
 # --- Aggancio a frasi musicali (8/16 battute), non solo al singolo beat -------------------
-def group_beats_into_phrases(beat_grid_samples, beats_per_phrase=8):
+def group_beats_into_phrases(beat_grid_samples, beats_per_phrase=8, phase=0):
     """I DJ non allineano solo i beat, allineano le FRASI (blocchi di 8/16 battute: intro,
     verse, drop...). Raggruppiamo la griglia beat già rilevata in blocchi di N beat e
     restituiamo solo l'inizio di ogni blocco: sono i punti 'strutturalmente giusti' dove
     piazzare un overlay, non un beat qualsiasi in mezzo a una frase."""
     if not beat_grid_samples or beats_per_phrase <= 0:
         return beat_grid_samples
-    return beat_grid_samples[::beats_per_phrase]
+    # `phase` = indice del primo downbeat: le frasi partono da li' e non dal primo beat qualunque
+    return beat_grid_samples[max(0, int(phase or 0)) % beats_per_phrase::beats_per_phrase]
 
 
 # --- EQ Bass Swap: taglia i bassi del frammento overlay per non "impastare" col leader ----
 def apply_bass_cut(seg, sr, cutoff_hz=150, order=4):
-    """Filtro passa-alto in stile Linkwitz-Riley (LR4): cascata di due Butterworth del 2°
-    ordine, invece di un singolo Butterworth del 4° ordine — stesso principio dei crossover
-    professionali (usato ad es. in strumenti come AutoDJ Smart Mixer). Rispetto a un Butterworth
-    singolo, l'attenuazione esattamente al punto di taglio è -6dB invece di -3dB: un 'gradino'
-    più netto e deciso proprio dove serve, verificato per confronto diretto (Butterworth: -2.93dB,
-    LR4: -5.94dB alla stessa frequenza di taglio), a parità di tenuta sopra/sotto.
-    Zero-phase (sosfiltfilt) per non introdurre click. È la versione 'leggera' del classico
-    EQ bass-swap che fanno i DJ col mixer hardware — qui usata per pulire i bassi dei
-    frammenti overlay, cosi' non litigano con la linea di basso del leader che resta intatta.
-    NOTA: sosfiltfilt richiede un padlen minimo (verificato: 15 campioni anche con la cascata
-    LR4 a 4 sezioni); la soglia qui sotto sta abbondantemente sopra quel limite, col try/except
-    comunque a fare da rete di sicurezza per qualunque altro edge case."""
+    """Filtro passa-alto con risposta in ampiezza Linkwitz-Riley (LR4): -6dB esatti alla frequenza
+    di taglio, pendenza 24dB/ottava, zero-phase (nessun click da sfasamento).
+    Trucco: un Butterworth del 2° ordine applicato con sosfiltfilt (avanti + indietro) ha
+    risposta |H|^2, che e' ESATTAMENTE la risposta in ampiezza di un LR4 (= due Butterworth
+    2° ordine in cascata). Prima la cascata di due stage passava ANCHE per sosfiltfilt, quindi
+    il filtro veniva applicato 4 volte: -12dB al taglio e pendenza 48dB/ottava, cioe' molto piu'
+    aggressivo di quanto dichiarato (verificato numericamente: -12.04dB vs -6.02dB).
+    `order` e' l'ordine della risposta finale (4 = LR4): lo stage singolo usa order // 2.
+    E' la versione 'leggera' dell'EQ bass-swap dei DJ: pulisce i bassi dei frammenti overlay
+    cosi' non litigano con la linea di basso del leader, che resta intatta.
+    Sotto una lunghezza minima (padlen di sosfiltfilt) o in caso di qualunque errore,
+    restituisce il frammento invariato invece di rompere il mix."""
     if not SCIPY_DISPONIBILE or seg.shape[1] < max(30, order * 6):
         return seg
     try:
         sos_stage = butter(order // 2, cutoff_hz, btype='highpass', fs=sr, output='sos')
-        sos_lr4 = np.vstack([sos_stage, sos_stage])  # cascata: applica lo stage due volte
-        filtered = np.stack([sosfiltfilt(sos_lr4, seg[ch]) for ch in range(seg.shape[0])], axis=0)
+        filtered = np.stack([sosfiltfilt(sos_stage, seg[ch]) for ch in range(seg.shape[0])], axis=0)
         return filtered
     except Exception:
         return seg  # in caso di segmento troppo corto o altro problema, non rompo il mix
@@ -610,10 +675,11 @@ def apply_echo_fx(seg, sr, delay_ms=125, feedback=0.35, num_repeats=3, mix=0.5):
         return seg
 
 
-@st.cache_data
-def analyze_track(audio_file_object):
-    """Analizza un file audio: carica in stereo, converte in WAV temporaneo, rileva tempo.
-    Il file temporaneo viene sempre ripulito (fix bug #3)."""
+def carica_audio_stereo(audio_file_object):
+    """Decodifica un file audio in array stereo (2, n) a TARGET_SR, senza analisi.
+    Il file temporaneo viene sempre ripulito (fix bug #3). Funzione separata da
+    analyze_track perche' il Batch BPM Matcher la riusa per RILEGGERE il brano al momento
+    dell'allineamento, invece di tenerlo decodificato in RAM per tutta la sessione."""
     audio_file_object.seek(0)
     tmp_path = None
     try:
@@ -629,21 +695,147 @@ def analyze_track(audio_file_object):
         # cosi' l'intera pipeline a valle puo' sempre assumere shape (2, n).
         if y.ndim == 1:
             y = np.stack([y, y], axis=0)
-
-        # Il beat tracking lavora su un segnale mono: usiamo la media dei due canali solo per l'analisi.
-        y_mono_for_beat = np.mean(y, axis=0)
-        tempo_raw, beat_samples = librosa.beat.beat_track(y=y_mono_for_beat, sr=sr, units="samples")
-        tempo_raw_val = float(tempo_raw[0]) if isinstance(tempo_raw, np.ndarray) else float(tempo_raw)
-        # Raffino il BPM globale con la mediana degli intervalli reali tra i beat rilevati:
-        # più preciso della singola stima algoritmica di beat_track (fix precisione BPM).
-        tempo_val = refine_tempo_from_beats(beat_samples, sr, tempo_raw_val)
-        return y, sr, tempo_val
+        return y, sr
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
 
 
-def get_beat_segments(y, sr, tempo, num_beats):
+def analyze_track_uncached(audio_file_object):
+    """Carica in stereo e rileva il tempo. Ritorna (y, sr, tempo, beats, fase_downbeat): `beats` e' la griglia
+    dei beat rilevati (lista di campioni interi), conservata nel deck per due scopi: far partire
+    i tagli 'a tempo' in fase col primo beat reale, e riusarla come griglia magnetica del
+    beatmatching in DJ Remix invece di rifare beat_track ad ogni generazione."""
+    y, sr = carica_audio_stereo(audio_file_object)
+
+    # Il beat tracking lavora su un segnale mono: usiamo la media dei due canali solo per l'analisi.
+    y_mono_for_beat = np.mean(y, axis=0)
+    tempo_raw, beat_samples = librosa.beat.beat_track(y=y_mono_for_beat, sr=sr, units="samples")
+    tempo_raw_val = float(tempo_raw[0]) if isinstance(tempo_raw, np.ndarray) else float(tempo_raw)
+    # Raffino il BPM globale con la mediana degli intervalli reali tra i beat rilevati:
+    # più preciso della singola stima algoritmica di beat_track (fix precisione BPM).
+    tempo_val = refine_tempo_from_beats(beat_samples, sr, tempo_raw_val)
+    beats = [int(b) for b in np.sort(np.asarray(beat_samples))] if len(beat_samples) else []
+    fase_db, conf_db = estimate_downbeat_phase(y_mono_for_beat, sr, beats)
+    # Sotto soglia la stima non e' affidabile: meglio nessun downbeat che uno sbagliato.
+    if conf_db < DOWNBEAT_MIN_CONFIDENCE:
+        fase_db = None
+    return y, sr, tempo_val, beats, fase_db
+
+
+# max_entries: la cache tiene una copia (pickle) di ogni brano decodificato; senza limite
+# cresceva all'infinito a ogni file diverso caricato. 6 copre i deck realmente in uso.
+@st.cache_data(max_entries=6)
+def analyze_track(audio_file_object):
+    """Versione cached di analyze_track_uncached, usata dai deck (il 'Ricarica in RAM' di un
+    deck liberato e' quasi istantaneo se il file e' ancora in cache)."""
+    return analyze_track_uncached(audio_file_object)
+
+
+def fase_primo_beat(first_beat, tempo, sr, rate=1.0, beats_per_unit=1):
+    """Offset (in campioni) da cui far partire una griglia di tagli a tempo, cosi' che i tagli
+    cadano SUI beat reali del brano e non a metà battuta. Prima i tagli partivano sempre dal
+    campione 0, ignorando dove cade davvero il primo beat. Si prende il primo beat modulo la
+    lunghezza di un beat: si scarta al massimo il materiale prima del primo punto di griglia (meno di un beat; fino a una misura coi downbeat).
+    `rate` e' il time-stretch eventualmente applicato (le posizioni scalano di 1/rate).
+    `beats_per_unit`: 1 = fase sul beat; 4 = fase sulla BATTUTA (si passa il primo downbeat,
+    cosi' i tagli da 4/8 battute partono davvero dall'inizio di una misura)."""
+    if first_beat is None or tempo is None or tempo <= 1e-3 or not rate or rate <= 0:
+        return 0
+    samples_per_beat = sr * 60.0 / tempo * max(1, int(beats_per_unit))
+    if samples_per_beat <= 0:
+        return 0
+    return int((first_beat / rate) % samples_per_beat)
+
+
+def primo_downbeat_deck(d):
+    """Primo downbeat stimato di un deck (campioni, gia' corretto per l'eventuale trim), o None
+    se la stima non c'e' o non era abbastanza affidabile."""
+    fase = d.get('downbeat_phase')
+    beats = d.get('beats')
+    if fase is None or not beats or fase >= len(beats):
+        return None
+    return beats[fase]
+
+
+def fase_deck(d, tempo, sr, rate=1.0, usa_downbeat=False):
+    """Offset di partenza dei tagli a tempo per un deck: sulla battuta (downbeat) se richiesto
+    e disponibile, altrimenti sul primo beat rilevato."""
+    if usa_downbeat:
+        fb = primo_downbeat_deck(d)
+        if fb is not None:
+            return fase_primo_beat(fb, tempo, sr, rate, beats_per_unit=4)
+    return fase_primo_beat(primo_beat_deck(d), tempo, sr, rate)
+
+
+def estimate_downbeat_phase(y_mono, sr, beat_samples, beats_per_bar=4, fmax_hz=2000.0):
+    """Stima quale beat (modulo beats_per_bar) e' l'inizio di una misura, con la differenza
+    spettrale tra frame sincroni ai beat (idea di Davies & Plumbley, EUSIPCO 2006: i downbeat
+    sono i beat dove il cambiamento spettrale tra il prima e il dopo e' massimo — rientra il
+    basso, cambia l'accordo, parte la frase). Qui: spettro band-limited (< fmax_hz) in scala
+    log, media su ogni intervallo di beat, aumento positivo di energia dal beat precedente al
+    successivo, poi si sceglie la fase (0..beats_per_bar-1) con la media piu' alta.
+    Assume tempo in 4/4 (la quasi totalita' della musica da club). E' una STIMA euristica,
+    senza reti neurali: ritorna (fase, confidenza) con confidenza = quanto la fase migliore
+    supera la media delle altre (0..1). Ritorna (None, 0.0) se i beat sono troppo pochi."""
+    beats = np.asarray(beat_samples, dtype=np.int64)
+    if len(beats) < beats_per_bar * 4 or len(y_mono) < 4096:
+        return None, 0.0
+    try:
+        n_fft, hop = 2048, 512
+        n_bins = max(8, int(fmax_hz * n_fft / sr) + 1)
+        chunk_frames = 2048
+        cols = []
+        # STFT a blocchi, tenendo solo le colonne band-limited: su un brano intero la STFT
+        # completa pesa centinaia di MB, cosi' invece resta in pochi MB.
+        for f0 in range(0, 1 + max(0, (len(y_mono) - n_fft) // hop), chunk_frames):
+            a = f0 * hop
+            seg = y_mono[a:a + (chunk_frames - 1) * hop + n_fft]
+            if len(seg) < n_fft:
+                break
+            S = np.abs(librosa.stft(seg, n_fft=n_fft, hop_length=hop, center=False))[:n_bins]
+            cols.append(np.log1p(10.0 * S))
+        if not cols:
+            return None, 0.0
+        L = np.concatenate(cols, axis=1)                       # (bins, frames)
+        csum = np.concatenate([np.zeros((L.shape[0], 1)), np.cumsum(L, axis=1)], axis=1)
+        F = L.shape[1]
+        # indice di frame il cui centro cade sul beat
+        fb = np.clip(np.round((beats - n_fft // 2) / hop).astype(int), 0, F)
+
+        def media(a, b):
+            return (csum[:, b] - csum[:, a]) / max(1, b - a)
+
+        diff = np.full(len(beats), np.nan)
+        for k in range(1, len(beats) - 1):
+            a0, a1, a2 = fb[k - 1], fb[k], fb[k + 1]
+            if a1 - a0 < 1 or a2 - a1 < 1:
+                continue
+            d = media(a1, a2) - media(a0, a1)                  # dopo - prima
+            diff[k] = float(np.sum(np.maximum(d, 0.0)))        # solo l'AUMENTO di energia
+        scores = []
+        for p in range(beats_per_bar):
+            v = diff[p::beats_per_bar]
+            v = v[~np.isnan(v)]
+            scores.append(float(np.mean(v)) if len(v) else 0.0)
+        scores = np.asarray(scores)
+        best = int(np.argmax(scores))
+        altri = np.delete(scores, best)
+        if scores[best] <= 1e-9:
+            return None, 0.0
+        confidenza = float((scores[best] - np.mean(altri)) / scores[best])
+        return best, max(0.0, min(1.0, confidenza))
+    except Exception:
+        return None, 0.0
+
+
+def primo_beat_deck(d):
+    """Primo beat rilevato di un deck (campioni, gia' corretto per l'eventuale trim), o None."""
+    beats = d.get('beats')
+    return beats[0] if beats else None
+
+
+def get_beat_segments(y, sr, tempo, num_beats, start_offset=0):
     """Segmenta in base al BPM, con guardia su tempo invalido e lunghezza minima/massima (fix bug #2, #5).
     y ha shape (2, n): il taglio avviene lungo l'asse temporale (asse 1), mantenendo entrambi i canali."""
     if tempo is None or tempo <= 1e-3:
@@ -657,24 +849,26 @@ def get_beat_segments(y, sr, tempo, num_beats):
     segment_length = max(MIN_SEGMENT_SAMPLES, min(segment_length, max_samples))
 
     total_samples = y.shape[1]
+    start_offset = max(0, int(start_offset or 0))  # fase della griglia (vedi fase_primo_beat)
     # .copy() e' essenziale: senza, ogni segmento sarebbe solo una "vista" sulla memoria
     # dell'array originale, quindi anche liberando d['y'] la RAM non verrebbe mai rilasciata.
     return [
         y[:, i:i + segment_length].copy()
-        for i in range(0, total_samples, segment_length)
+        for i in range(start_offset, total_samples, segment_length)
         if (i + segment_length) <= total_samples
     ]
 
 
-def get_random_segments(y, sr, min_dur, max_dur):
+def get_random_segments(y, sr, min_dur, max_dur, rng=None):
     """Segmentazione casuale, con guardia contro durate/lunghezze a zero (fix bug #2).
     y ha shape (2, n): il taglio avviene lungo l'asse temporale (asse 1)."""
+    rng = rng if rng is not None else random  # RNG seedato iniettato: taglio riproducibile
     segments = []
     curr = 0
     total_samples = y.shape[1]
     min_dur = max(min_dur, MIN_SEGMENT_SAMPLES / sr)  # mai sotto la soglia minima
     while curr < total_samples:
-        dur = random.uniform(min_dur, max_dur)
+        dur = rng.uniform(min_dur, max_dur)
         length = int(dur * sr)
         if length <= 0:
             break
@@ -685,7 +879,7 @@ def get_random_segments(y, sr, min_dur, max_dur):
     return segments
 
 
-def get_beat_segments_range(y, sr, tempo, min_beats, max_beats):
+def get_beat_segments_range(y, sr, tempo, min_beats, max_beats, start_offset=0, rng=None):
     """Come get_beat_segments, ma invece di un numero fisso di battute per taglio, ogni
     segmento usa una lunghezza casuale (in battute) pescata nel range [min_beats, max_beats].
     Utile per non avere sempre tagli tutti identici anche in modalità 'a ritmo'."""
@@ -696,10 +890,11 @@ def get_beat_segments_range(y, sr, tempo, min_beats, max_beats):
     total_samples = y.shape[1]
     lo, hi = (min_beats, max_beats) if min_beats <= max_beats else (max_beats, min_beats)
 
+    rng = rng if rng is not None else random  # RNG seedato iniettato: taglio riproducibile
     segments = []
-    curr = 0
+    curr = max(0, int(start_offset or 0))  # fase della griglia (vedi fase_primo_beat)
     while curr < total_samples:
-        beats = random.uniform(lo, hi)
+        beats = rng.uniform(lo, hi)
         length = int(samples_per_beat * beats)
         length = max(MIN_SEGMENT_SAMPLES, min(length, max_samples))
         if curr + length > total_samples:
@@ -747,25 +942,27 @@ def get_onset_segments(y, sr, min_dur_sec=None, max_dur_sec=None):
 
 
 def get_leader_cut_lengths(y_leader, sr, leader_mode, tempo=None, num_beats=None,
-                            beats_range=None, onset_min_dur=None, onset_max_dur=None):
+                            beats_range=None, onset_min_dur=None, onset_max_dur=None,
+                            start_offset=0, rng=None):
     """Ricava dal deck 'leader' solo le LUNGHEZZE dei tagli (non l'audio), da imporre
     poi a tutti gli altri deck: e' la 'struttura' che i follower devono rispettare."""
     if leader_mode == "onset":
         segs = get_onset_segments(y_leader, sr, onset_min_dur, onset_max_dur)
     else:  # "bpm"
         if beats_range is not None:
-            segs = get_beat_segments_range(y_leader, sr, tempo, beats_range[0], beats_range[1])
+            segs = get_beat_segments_range(y_leader, sr, tempo, beats_range[0], beats_range[1],
+                                           start_offset=start_offset, rng=rng)
         else:
-            segs = get_beat_segments(y_leader, sr, tempo, num_beats)
+            segs = get_beat_segments(y_leader, sr, tempo, num_beats, start_offset=start_offset)
     return [s.shape[1] for s in segs]
 
 
-def apply_cut_lengths(y, lengths):
+def apply_cut_lengths(y, lengths, start_offset=0):
     """Applica in sequenza una lista di lunghezze (derivata dal leader) a un deck qualsiasi,
     scorrendo il suo audio dall'inizio. Se il deck 'follower' finisce prima di esaurire
     tutte le lunghezze richieste, si ferma semplicemente li' — nessun loop forzato."""
     segments = []
-    curr = 0
+    curr = max(0, int(start_offset or 0))  # ogni deck parte dal proprio primo beat (fase), non da 0
     total_samples = y.shape[1]
     for length in lengths:
         if length <= 0:
@@ -777,15 +974,25 @@ def apply_cut_lengths(y, lengths):
     return segments
 
 
-def export_audio(y, sr):
+def export_audio(y, sr, ceiling_db=-1.0, boost=True):
     """Esporta un array stereo (2, n) in MP3 stereo a 320kbps, con interleaving corretto
     dei canali. NOTA: prima di questo fix, il bitrate non era mai specificato esplicitamente,
     quindi pydub/ffmpeg usava un default molto più basso (~130kbps verificato), nonostante
     tutti i report dell'app dichiarassero 320kbps — un bug reale, non solo percezione."""
     if y.shape[1] == 0:
         return None
-    max_val = np.max(np.abs(y))
-    y_norm = (y / max_val * 32767).astype(np.int16) if max_val > 0 else y.astype(np.int16)
+    # Headroom: prima il picco veniva SEMPRE portato a 0 dBFS, annullando il lavoro del
+    # compressore e rischiando clipping inter-sample nella codifica MP3. Ora il tetto e' a
+    # `ceiling_db` (default -1 dBFS).
+    # boost=True  -> il picco va esattamente al tetto (mix finale: massimo livello utile).
+    # boost=False -> si ABBASSA solo se si supera il tetto, senza mai amplificare: serve al
+    #               Batch BPM Matcher, dove la normalizzazione per-traccia annullerebbe
+    #               il bilanciamento LUFS tra le tracce dello ZIP.
+    ceiling = 10 ** (ceiling_db / 20.0)
+    max_val = float(np.max(np.abs(y)))
+    if max_val > 0 and (boost or max_val > ceiling):
+        y = y * (ceiling / max_val)
+    y_norm = np.clip(y * 32767.0, -32768, 32767).astype(np.int16)
 
     # y_norm ha shape (2, n): trasponiamo a (n, 2) e appiattiamo per ottenere
     # il classico interleaving L,R,L,R,... richiesto da un file audio stereo.
@@ -874,7 +1081,8 @@ def find_strongest_onset_offset(seg, sr):
 def build_dj_remix_overlay(leader_y, leader_sr, overlay_segments, overlay_gain, num_events,
                             rng, deck_weights=None, beatmatch=True, phrase_beats=None,
                             bass_cutoff_hz=None, hpss_mode=None, reverse_probability=0.0,
-                            loop_roll_probability=0.0, loop_roll_repeats=4, echo_probability=0.0):
+                            loop_roll_probability=0.0, loop_roll_repeats=4, echo_probability=0.0,
+                            precomputed_beat_grid=None, downbeat_phase=None):
     """Costruisce un mix 'letto + overlay': leader_y resta INTATTO come base (nessun taglio),
     e sopra vengono sparsi num_events frammenti presi da overlay_segments, sommati (non
     concatenati), moltiplicati per overlay_gain.
@@ -903,11 +1111,22 @@ def build_dj_remix_overlay(leader_y, leader_sr, overlay_segments, overlay_gain, 
     if not overlay_segments or total == 0:
         return buffer, 0, []
 
-    beat_grid = get_beat_grid_samples(leader_y, leader_sr) if beatmatch else []
+    beat_grid = []
+    fase_frase = 0  # indice del primo downbeat nella griglia (0 = non noto)
+    if beatmatch:
+        if precomputed_beat_grid:
+            if downbeat_phase is not None:
+                fase_frase = int(downbeat_phase)  # la griglia filtrata conserva gli indici (si tagliano solo i beat finali)
+            # Griglia gia' rilevata in analisi (e corretta per il trim): evita di rifare beat_track
+            # sull'intero leader ad ogni generazione. Si scartano i beat oltre il buffer (anteprima).
+            beat_grid = [b for b in precomputed_beat_grid if 0 <= b < total]
+        if not beat_grid:
+            beat_grid = get_beat_grid_samples(leader_y, leader_sr)
+            fase_frase = 0  # griglia ricalcolata: la fase del downbeat non e' piu' riferita a questa
     if beatmatch and not beat_grid:
         beatmatch = False  # il leader non ha un beat rilevabile: fallback a piazzamento casuale
     if beatmatch and phrase_beats:
-        frase_grid = group_beats_into_phrases(beat_grid, phrase_beats)
+        frase_grid = group_beats_into_phrases(beat_grid, phrase_beats, phase=fase_frase)
         if frase_grid:
             beat_grid = frase_grid  # aggancio solo agli inizi di frase, non a ogni beat
 
@@ -918,7 +1137,7 @@ def build_dj_remix_overlay(leader_y, leader_sr, overlay_segments, overlay_gain, 
             counts[s['deck']] = counts.get(s['deck'], 0) + 1
         weights_list = [deck_weights.get(s['deck'], 5) / max(1, counts.get(s['deck'], 1)) for s in overlay_segments]
 
-    hpss_cache = {}  # id(pick) -> audio isolato, per non ricalcolare l'HPSS ad ogni ripescata
+    prep_cache = {}  # id(pick) -> audio dopo HPSS + bass cut, calcolato una sola volta per frammento
     placed = 0
     attempts = 0
     max_attempts = max(500, num_events * 20)  # guardia anti-loop-infinito, stessa logica del bug #2
@@ -930,15 +1149,18 @@ def build_dj_remix_overlay(leader_y, leader_sr, overlay_segments, overlay_gain, 
         if seg.shape[1] <= 0:
             continue
 
-        if hpss_mode:
+        if hpss_mode or bass_cutoff_hz:
             cache_key = id(pick)
-            if cache_key not in hpss_cache:
-                hpss_cache[cache_key] = apply_hpss_isolation(seg, leader_sr, mode=hpss_mode)
-            seg = hpss_cache[cache_key]
-        if bass_cutoff_hz:
-            # EQ Bass Swap: tolgo i bassi dall'overlay PRIMA di sommarlo, non dopo — cosi'
-            # il leader sotto resta con la sua linea di basso intatta e pulita.
-            seg = apply_bass_cut(seg, leader_sr, cutoff_hz=bass_cutoff_hz)
+            if cache_key not in prep_cache:
+                prepared = seg
+                if hpss_mode:
+                    prepared = apply_hpss_isolation(prepared, leader_sr, mode=hpss_mode)
+                if bass_cutoff_hz:
+                    # EQ Bass Swap: tolgo i bassi dall'overlay PRIMA di sommarlo, non dopo — cosi'
+                    # il leader sotto resta con la sua linea di basso intatta e pulita.
+                    prepared = apply_bass_cut(prepared, leader_sr, cutoff_hz=bass_cutoff_hz)
+                prep_cache[cache_key] = prepared
+            seg = prep_cache[cache_key]
 
         # FX stocastici indipendenti: ognuno può cambiare la lunghezza del frammento,
         # quindi invalidano l'onset_offset precalcolato (lo ricalcoliamo sotto se serve).
@@ -1082,22 +1304,27 @@ def normalize_loudness(y, sr, target_lufs=-18.0):
         return y
 
 
-def trim_silence_stereo(y, top_db=40):
+def trim_silence_stereo(y, top_db=40, return_offset=False):
     """Rimuove il silenzio (sotto top_db) da inizio e fine di un deck stereo (2, n), usando
     l'energia combinata dei due canali per decidere i punti di taglio, poi applicando lo
     STESSO taglio a entrambi (cosi' L/R restano sincronizzati). Utile soprattutto per il
     deck leader in DJ Remix: senza trim, silenzio in testa/coda è 'spazio morto' dove un
-    overlay può finire piazzato inutilmente."""
+    overlay può finire piazzato inutilmente.
+    return_offset=True ritorna (audio, campioni_tagliati_in_testa): serve a spostare di pari
+    passo la griglia dei beat rilevata PRIMA del trim."""
+    def _ret(y_out, offset):
+        return (y_out, offset) if return_offset else y_out
+
     if y.shape[1] == 0:
-        return y
+        return _ret(y, 0)
     try:
         y_mono = np.mean(np.abs(y), axis=0)
         _, index = librosa.effects.trim(y_mono, top_db=top_db)
         if index[1] <= index[0]:
-            return y  # trim risultato vuoto/invertito: non rischio di azzerare il deck
-        return y[:, index[0]:index[1]]
+            return _ret(y, 0)  # trim risultato vuoto/invertito: non rischio di azzerare il deck
+        return _ret(y[:, index[0]:index[1]], int(index[0]))
     except Exception:
-        return y
+        return _ret(y, 0)
 
 
 def build_waveform_image(final_y, sr, events=None, title="Loop507 Mix"):
@@ -1144,10 +1371,93 @@ def invalidate_mix():
     st.session_state.pop("mix_ready", None)
     st.session_state.pop("mix_preset", None)
     st.session_state.pop("mix_events", None)
+    st.session_state.pop("mix_events_sr", None)
+    st.session_state.pop("mix_events_tempo", None)
     st.session_state.pop("dj_rendered_by_deck", None)
     st.session_state.pop("mix_is_preview", None)
     st.session_state.pop("mix_waveform_image", None)
     st.session_state.audio_report = ""
+
+
+def crea_rng_taglio(seed_input):
+    """RNG locale e seedato per la fase di TAGLIO (modalità con casualità: Frenesia Casuale,
+    range di battute). Prima il taglio usava il `random` globale non seedato, quindi il
+    seed del preset garantiva solo l'assemblaggio del mix, non i tagli: il mix NON era davvero
+    riproducibile. Il seed usato viene salvato in session_state per finire nel preset."""
+    seed = int(seed_input) if seed_input and seed_input > 0 else random.randint(1, 2**31 - 1)
+    st.session_state.cut_seed_used = seed
+    return random.Random(f"cut:{seed}")
+
+
+def applica_preparazione(y, sr, trim=False, trim_db=40, normalizza=False, target_lufs=-18.0):
+    """Trim del silenzio + normalizzazione LUFS (stesso ordine usato per i deck: prima il trim,
+    cosi' il silenzio tagliato non falsa la misura di loudness)."""
+    if trim:
+        y = trim_silence_stereo(y, top_db=trim_db)
+    if normalizza:
+        y = normalize_loudness(y, sr, target_lufs=target_lufs)
+    return y
+
+
+def prepara_deck(up_file, correggi_ottava_on, bpm_range, trim, trim_db, normalizza, target_lufs):
+    """Analisi completa di un deck: carica, rileva BPM (+correzione ottava), trim, LUFS, e
+    sposta la griglia dei beat di pari passo col trim. Ritorna (y, sr, tempo, beats, fase_downbeat)."""
+    y, sr, t, beats, fase_db = analyze_track(up_file)
+    if correggi_ottava_on and t > 0:
+        t = correggi_errore_ottava(t, bpm_range[0], bpm_range[1])
+    trim_off = 0
+    if trim:
+        # Dopo l'analisi BPM: tagliare il silenzio non altera il tempo del contenuto reale.
+        y, trim_off = trim_silence_stereo(y, top_db=trim_db, return_offset=True)
+    if normalizza:
+        # Dopo il trim: il silenzio tagliato non influenza la misura di loudness.
+        y = normalize_loudness(y, sr, target_lufs=target_lufs)
+    n = y.shape[1]
+    beats_adj = [b - trim_off for b in beats if 0 <= b - trim_off < n]
+    if fase_db is not None:
+        # I beat tagliati in testa dal trim fanno scalare l'indice: la fase si sposta di pari passo.
+        persi = sum(1 for b in beats if b - trim_off < 0)
+        fase_db = (fase_db - persi) % 4
+        if fase_db >= len(beats_adj):
+            fase_db = None
+    return y, sr, t, beats_adj, fase_db
+
+
+def stretch_segments_in_blocks(audios, rate, sr, max_block_seconds=30):
+    """Time-stretch di una lista di frammenti dello STESSO deck, a blocchi: i frammenti
+    consecutivi vengono concatenati (fino a ~max_block_seconds), stretchati UNA volta con la
+    finestra STFT piena, poi ri-divisi in proporzione. Prima ogni frammento veniva stretchato
+    da solo: su pezzi di poche centinaia di campioni la STFT degrada (n_fft ridotto), e
+    l'operazione veniva rifatta per ogni singolo frammento ad ogni generazione. A blocchi la
+    qualità è quella del deck intero, ma la RAM resta limitata (niente STFT sull'intero brano)."""
+    out = [None] * len(audios)
+    max_block = int(max_block_seconds * sr)
+    block, block_idx, block_len = [], [], 0
+
+    def _flush():
+        if not block:
+            return
+        lengths = [a.shape[1] for a in block]
+        big = np.concatenate(block, axis=1)
+        stretched = time_stretch_stereo(big, rate)
+        total_in = sum(lengths)
+        scale = stretched.shape[1] / total_in if total_in > 0 else 1.0
+        bounds = np.round(np.cumsum([0] + lengths) * scale).astype(int)
+        for n_i, idx in enumerate(block_idx):
+            out[idx] = stretched[:, bounds[n_i]:bounds[n_i + 1]].copy()
+
+    for i, a in enumerate(audios):
+        if a.shape[1] <= 0:
+            out[i] = a
+            continue
+        if block and block_len + a.shape[1] > max_block:
+            _flush()
+            block, block_idx, block_len = [], [], 0
+        block.append(a)
+        block_idx.append(i)
+        block_len += a.shape[1]
+    _flush()
+    return out
 
 
 # --- Interfaccia Utente Streamlit ---
@@ -1156,7 +1466,7 @@ st.title("🎧 Loop507: Audio Shuffler & Glitcher")
 
 if 'decks' not in st.session_state:
     st.session_state.decks = {
-        k: {'y': None, 'sr': None, 'tempo': 0.0, 'tempo_detected': 0.0, 'name': None}
+        k: {'y': None, 'sr': None, 'tempo': 0.0, 'tempo_detected': 0.0, 'name': None, 'beats': [], 'downbeat_phase': None, 'size': None, 'prep_sig': None}
         for k in 'abcdefgh'
     }
 else:
@@ -1169,6 +1479,10 @@ else:
         _d.setdefault('y', None)
         _d.setdefault('sr', None)
         _d.setdefault('name', None)
+        _d.setdefault('beats', [])
+        _d.setdefault('downbeat_phase', None)
+        _d.setdefault('size', None)
+        _d.setdefault('prep_sig', None)
 if 'segments' not in st.session_state:
     st.session_state.segments = []
 if 'audio_report' not in st.session_state:
@@ -1221,7 +1535,8 @@ with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa veloc
     )
 
     if 'batch_results' not in st.session_state:
-        st.session_state.batch_results = []  # lista di dict: name, y, sr, tempo, key_nome, camelot
+        # lista di dict (SOLO metadati, niente audio decodificato: name, tempo, key_nome, camelot, prep...)
+        st.session_state.batch_results = []
     if 'batch_zip' not in st.session_state:
         st.session_state.batch_zip = None
 
@@ -1237,22 +1552,28 @@ with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa veloc
         progress = st.progress(0.0, text="Analizzo...")
         for i, bf in enumerate(batch_files):
             with st.spinner(f"Analizzo {bf.name}..."):
-                y, sr, t = analyze_track(bf)
+                # Niente cache e niente audio in session_state: il brano decodificato (~100MB per
+                # 5 minuti stereo) vive solo il tempo dell'analisi, poi viene rilasciato. Prima
+                # 10 tracce restavano tutte in RAM (~1GB, il limite di Streamlit Cloud) piu'
+                # le copie nella cache. All'allineamento il brano viene riletto uno alla volta.
+                y, sr, t, _beats, _fase_db = analyze_track_uncached(bf)
                 artista = extract_artist(bf)
                 if correggi_ottava and t > 0:
                     t = correggi_errore_ottava(t, bpm_range_plausibile[0], bpm_range_plausibile[1])
-                if trim_silenzio:
-                    y = trim_silence_stereo(y, top_db=trim_soglia_db)
-                if normalizza_loudness:
-                    y = normalize_loudness(y, sr, target_lufs=target_lufs)
+                prep = {
+                    'trim': bool(trim_silenzio), 'trim_db': trim_soglia_db,
+                    'normalizza': bool(normalizza_loudness), 'target_lufs': target_lufs,
+                }
+                y = applica_preparazione(y, sr, **prep)
                 key_nome, camelot, _ = detect_key_camelot(y, sr)
                 ambiguita = check_tempo_ambiguity(y, sr, t) if t > 0 else []
                 crosscheck = cross_check_tempo(y, sr, t) if t > 0 else {"esito": "n/d", "feature_tempo": None, "aubio_tempo": None}
                 st.session_state.batch_results.append({
-                    'name': bf.name, 'artist': artista, 'y': y, 'sr': sr, 'tempo': t,
+                    'name': bf.name, 'artist': artista, 'tempo': t,
                     'key_nome': key_nome or "n/d", 'camelot': camelot or "?",
-                    'ambiguita': ambiguita, 'crosscheck': crosscheck
+                    'ambiguita': ambiguita, 'crosscheck': crosscheck, 'prep': prep
                 })
+                del y  # rilascio subito l'audio decodificato
             progress.progress((i + 1) / len(batch_files), text=f"Analizzato {bf.name}")
         progress.empty()
 
@@ -1300,15 +1621,31 @@ with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa veloc
             if st.button("🚀 Allinea tutte e genera ZIP", key="batch_align_btn"):
                 zip_buffer = BytesIO()
                 saltate = []
+                mancanti = []
+                # Rileggo i brani dal file_uploader (ancora in sessione): uno alla volta, cosi' il
+                # picco di RAM e' quello di UNA traccia e non di tutte insieme.
+                files_by_name = {f.name: f for f in (batch_files or [])}
                 with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
                     for r in st.session_state.batch_results:
                         if r['tempo'] <= 0:
                             saltate.append(r['name'])
                             continue  # nessun BPM di riferimento: non c'e' un rate calcolabile
+                        sorgente = files_by_name.get(r['name'])
+                        if sorgente is None:
+                            mancanti.append(r['name'])  # file rimosso dall'uploader dopo l'analisi
+                            continue
                         with st.spinner(f"Allineo {r['name']}..."):
+                            y_src, sr_src = carica_audio_stereo(sorgente)
+                            # Stessa preparazione (trim/LUFS) usata in analisi, cosi' il file
+                            # esportato coincide con quello su cui sono stati misurati BPM e tonalità.
+                            y_src = applica_preparazione(y_src, sr_src, **r['prep'])
                             rate = target_bpm / r['tempo']
-                            y_stretched = time_stretch_stereo(r['y'], rate)
-                            mp3_buffer = export_audio(y_stretched, r['sr'])
+                            y_stretched = time_stretch_stereo(y_src, rate)
+                            del y_src
+                            # boost=False: niente normalizzazione per-traccia al picco, che
+                            # annullerebbe il bilanciamento LUFS tra le tracce dello ZIP.
+                            mp3_buffer = export_audio(y_stretched, sr_src, boost=False)
+                            del y_stretched
                         if mp3_buffer:
                             base_name = os.path.splitext(r['name'])[0]
                             zf.writestr(f"{base_name}_{target_bpm:.0f}bpm.mp3", mp3_buffer.read())
@@ -1325,6 +1662,11 @@ with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa veloc
                 st.session_state.batch_zip = zip_buffer.getvalue()
                 if saltate:
                     st.info(f"Saltate (nessun BPM rilevato): {', '.join(saltate)}")
+                if mancanti:
+                    st.warning(
+                        f"Non allineate (file non più presente nell'uploader, ricaricalo e rianalizza): "
+                        f"{', '.join(mancanti)}"
+                    )
 
     if st.session_state.get('batch_report'):
         with st.expander("📄 Anteprima report (incluso nello ZIP)"):
@@ -1336,6 +1678,15 @@ with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa veloc
             "loop507_batch_allineato.zip", mime="application/zip", use_container_width=True
         )
 
+# Firma delle impostazioni di preparazione (conta solo cio' che e' davvero attivo: un target LUFS
+# non cambia nulla se la normalizzazione e' spenta). Serve a segnalare i deck preparati con
+# impostazioni diverse da quelle attuali (trim/LUFS/ottava cambiati dopo il caricamento).
+prep_sig_now = (
+    bool(correggi_ottava), tuple(bpm_range_plausibile) if correggi_ottava else None,
+    bool(trim_silenzio), trim_soglia_db if trim_silenzio else None,
+    bool(normalizza_loudness), target_lufs if normalizza_loudness else None,
+)
+
 deck_keys = list(st.session_state.decks.keys())
 for row_idx in [0, 4]:
     cols = st.columns(4)
@@ -1344,21 +1695,22 @@ for row_idx in [0, 4]:
             st.markdown(f"### Deck {k.upper()}")
             up = st.file_uploader(f"Carica {k.upper()}", type=["mp3", "wav"], key=f"up_{k}", label_visibility="collapsed")
             if up:
-                if st.session_state.decks[k]['name'] != up.name:
+                # Stesso nome MA dimensione diversa = file diverso (prima non veniva rianalizzato)
+                _d_old = st.session_state.decks[k]
+                _file_cambiato = (
+                    _d_old['name'] != up.name
+                    or (_d_old.get('size') is not None and _d_old['size'] != getattr(up, 'size', None))
+                )
+                if _file_cambiato:
                     with st.spinner(f"Analizzando {k.upper()}..."):
-                        y, sr, t = analyze_track(up)
-                        if correggi_ottava and t > 0:
-                            t = correggi_errore_ottava(t, bpm_range_plausibile[0], bpm_range_plausibile[1])
-                        if trim_silenzio:
-                            # Prima del trim, DOPO l'analisi BPM: tagliare il silenzio non
-                            # altera il tempo del contenuto reale, solo lo 'spazio morto' attorno.
-                            y = trim_silence_stereo(y, top_db=trim_soglia_db)
-                        if normalizza_loudness:
-                            # Normalizzo DOPO il trim: cosi' il silenzio tagliato non influenza
-                            # la misura di loudness del contenuto reale.
-                            y = normalize_loudness(y, sr, target_lufs=target_lufs)
+                        y, sr, t, beats, fase_db = prepara_deck(
+                            up, correggi_ottava, bpm_range_plausibile,
+                            trim_silenzio, trim_soglia_db, normalizza_loudness, target_lufs
+                        )
                         st.session_state.decks[k] = {
-                            'y': y, 'sr': sr, 'tempo': t, 'tempo_detected': t, 'name': up.name
+                            'y': y, 'sr': sr, 'tempo': t, 'tempo_detected': t, 'name': up.name,
+                            'beats': beats, 'downbeat_phase': fase_db,
+                            'size': getattr(up, 'size', None), 'prep_sig': prep_sig_now
                         }
                         # Cambiando un deck, i vecchi segmenti/mix non sono piu' validi (fix bug #4)
                         st.session_state.segments = []
@@ -1370,6 +1722,28 @@ for row_idx in [0, 4]:
                         if bpm_key in st.session_state:
                             del st.session_state[bpm_key]
                         st.session_state.pop(f"exported_rend_{k}", None)  # export renderizzato del vecchio file non più valido
+                _d_now = st.session_state.decks[k]
+                if _d_now['y'] is not None and _d_now.get('prep_sig') not in (None, prep_sig_now):
+                    st.warning("⚠️ Trim/LUFS/correzione ottava sono cambiati dopo il caricamento: questo deck usa ancora le vecchie impostazioni.")
+                    if st.button(f"🔄 Ricalcola Deck {k.upper()} con le impostazioni attuali", key=f"reprep_{k}"):
+                        with st.spinner(f"Ricalcolo {k.upper()}..."):
+                            y, sr, t, beats, fase_db = prepara_deck(
+                                up, correggi_ottava, bpm_range_plausibile,
+                                trim_silenzio, trim_soglia_db, normalizza_loudness, target_lufs
+                            )
+                            # Se l'utente aveva impostato un BPM manuale lo conservo; altrimenti
+                            # riparto dal BPM appena rilevato (e azzero il widget per riflettere il nuovo valore).
+                            _manuale = _d_now['tempo'] if abs(_d_now['tempo'] - _d_now.get('tempo_detected', 0.0)) > 1e-6 else None
+                            st.session_state.decks[k].update({
+                                'y': y, 'sr': sr, 'tempo': _manuale if _manuale else t, 'tempo_detected': t,
+                                'beats': beats, 'downbeat_phase': fase_db, 'prep_sig': prep_sig_now
+                            })
+                            if not _manuale:
+                                st.session_state.pop(f"bpm_manual_{k}", None)
+                            st.session_state.segments = []
+                            invalidate_mix()
+                            st.session_state.pop(f"exported_rend_{k}", None)
+                        st.rerun()
                 if st.session_state.decks[k]['y'] is not None:
                     st.success(f"{up.name}")
                     mem_mb = estimate_memory_mb(st.session_state.decks[k]['y'])
@@ -1439,9 +1813,15 @@ for row_idx in [0, 4]:
                         # analyze_track e' decorata con @st.cache_data: se il file non e' cambiato,
                         # questa chiamata NON rianalizza da zero, recupera solo il risultato già
                         # calcolato in precedenza — quindi è praticamente istantanea.
-                        y, sr, t = analyze_track(up)
+                        y, sr, t, beats, fase_db = prepara_deck(
+                            up, correggi_ottava, bpm_range_plausibile,
+                            trim_silenzio, trim_soglia_db, normalizza_loudness, target_lufs
+                        )
                         st.session_state.decks[k]['y'] = y
                         st.session_state.decks[k]['sr'] = sr
+                        st.session_state.decks[k]['beats'] = beats
+                        st.session_state.decks[k]['downbeat_phase'] = fase_db
+                        st.session_state.decks[k]['prep_sig'] = prep_sig_now
                         st.rerun()
 
 st.sidebar.header("🎛️ Pannello di Controllo")
@@ -1457,6 +1837,23 @@ if active_decks:
             "🎯 Slice per Transienti (Onset)",
             "👑 Deck Leader / Followers",
         ]
+    )
+
+    seed_taglio_input = st.sidebar.number_input(
+        "🎲 Seed taglio (0 = casuale ogni volta)", min_value=0, value=0, step=1,
+        help="Rende riproducibili i tagli che usano la casualità (Frenesia Casuale, range di "
+             "battute). Le altre modalità sono già deterministiche. Il seed usato finisce nel "
+             "preset come 'seed_taglio'; il seed del MIX si imposta più in basso."
+    )
+
+    usa_downbeat = st.sidebar.checkbox(
+        "🎼 Usa i downbeat (battuta 1) stimati",
+        value=False,
+        help="Stima, con la differenza spettrale tra beat (Davies & Plumbley, solo DSP), dove "
+             "inizia davvero ogni misura (4/4). Se attivo: i tagli a tempo partono dalla battuta 1 "
+             "invece che da un beat qualunque (così i tagli da 4 o 8 battute cadono sulle misure) e "
+             "l'aggancio a frasi del DJ Remix parte dal downbeat del leader. È una stima euristica: "
+             "dove l'affidabilità è bassa il downbeat viene scartato e si usa il primo beat."
     )
 
     taglio_meta = {}  # metadati del taglio corrente, valorizzati nel ramo attivo qui sotto;
@@ -1478,7 +1875,8 @@ if active_decks:
         else:
             beats = st.sidebar.selectbox("Battute per segmento:", [0.5, 1, 2, 4, 8], index=2)
             beats_range = None
-        taglio_meta = {"modalita": "bpm", "beats": beats, "beats_range": list(beats_range) if beats_range else None}
+        taglio_meta = {"modalita": "bpm", "beats": beats, "beats_range": list(beats_range) if beats_range else None,
+                       "downbeat": usa_downbeat}
         apply_stretch = st.sidebar.checkbox(
             "🎚️ Correggi davvero il tempo (time-stretch)",
             value=False,
@@ -1489,8 +1887,12 @@ if active_decks:
         if st.sidebar.button("🔨 Decomponi a Tempo"):
             st.session_state.segments = []
             stretched_decks = 0
+            cut_rng = crea_rng_taglio(seed_taglio_input) if beats_range is not None else None
+            if cut_rng is None:
+                st.session_state.cut_seed_used = None  # taglio a lunghezza fissa: nessuna casualità
             for k, d in active_decks.items():
                 y_for_cut = d['y']
+                fase_rate = 1.0  # time-stretch applicato (1.0 = nessuno): riporta il primo beat nella stessa scala
                 # Applico il time-stretch solo se: l'utente lo ha attivato, esiste un BPM
                 # rilevato affidabile come riferimento, e il BPM manuale è effettivamente diverso.
                 if apply_stretch and d['tempo_detected'] > 1.0 and d['tempo'] > 0 \
@@ -1499,10 +1901,14 @@ if active_decks:
                     with st.spinner(f"Time-stretch Deck {k.upper()} (rate {rate:.3f}x)..."):
                         y_for_cut = time_stretch_stereo(d['y'], rate)
                     stretched_decks += 1
+                    fase_rate = rate
+                # I tagli partono dal primo beat reale del deck, non dal campione 0
+                fase = fase_deck(d, d['tempo'], d['sr'], fase_rate, usa_downbeat)
                 if beats_range is not None:
-                    segs = get_beat_segments_range(y_for_cut, d['sr'], d['tempo'], beats_range[0], beats_range[1])
+                    segs = get_beat_segments_range(y_for_cut, d['sr'], d['tempo'], beats_range[0], beats_range[1],
+                                                   start_offset=fase, rng=cut_rng)
                 else:
-                    segs = get_beat_segments(y_for_cut, d['sr'], d['tempo'], beats)
+                    segs = get_beat_segments(y_for_cut, d['sr'], d['tempo'], beats, start_offset=fase)
                 for s in segs:
                     st.session_state.segments.append({'audio': s, 'sr': d['sr'], 'deck': k})
             invalidate_mix()
@@ -1521,8 +1927,9 @@ if active_decks:
         taglio_meta = {"modalita": "casuale", "range_sec": list(range_sec)}
         if st.sidebar.button("🌪️ Frulla Audio (Glitch)"):
             st.session_state.segments = []
+            cut_rng = crea_rng_taglio(seed_taglio_input)
             for k, d in active_decks.items():
-                segs = get_random_segments(d['y'], d['sr'], range_sec[0], range_sec[1])
+                segs = get_random_segments(d['y'], d['sr'], range_sec[0], range_sec[1], rng=cut_rng)
                 for s in segs:
                     st.session_state.segments.append({'audio': s, 'sr': d['sr'], 'deck': k})
             invalidate_mix()
@@ -1545,6 +1952,7 @@ if active_decks:
         taglio_meta = {"modalita": "onset", "durata_range_sec": list(onset_range)}
         if st.sidebar.button("⚡ Slice ai Transienti"):
             st.session_state.segments = []
+            st.session_state.cut_seed_used = None  # onset detection deterministica: nessun seed di taglio
             decks_senza_transienti = []
             for k, d in active_decks.items():
                 with st.spinner(f"Rilevo transienti Deck {k.upper()}..."):
@@ -1628,6 +2036,13 @@ if active_decks:
         if st.sidebar.button("👑 Applica Struttura del Leader"):
             leader_d = active_decks[leader_key]
             leader_mode = "bpm" if leader_submode == "BPM" else "onset"
+            cut_rng = crea_rng_taglio(seed_taglio_input) if (leader_mode == "bpm" and leader_beats_range is not None) else None
+            if cut_rng is None:
+                st.session_state.cut_seed_used = None  # nessuna casualità nel taglio del leader
+            leader_fase = (
+                fase_deck(leader_d, leader_d['tempo'], leader_d['sr'], 1.0, usa_downbeat)
+                if leader_mode == "bpm" else 0
+            )
             with st.spinner(f"Calcolo la struttura dal Deck {leader_key.upper()}..."):
                 lengths = get_leader_cut_lengths(
                     leader_d['y'], leader_d['sr'], leader_mode,
@@ -1635,6 +2050,7 @@ if active_decks:
                     beats_range=leader_beats_range,
                     onset_min_dur=leader_onset_range[0] if leader_onset_range else None,
                     onset_max_dur=leader_onset_range[1] if leader_onset_range else None,
+                    start_offset=leader_fase, rng=cut_rng,
                 )
             if not lengths:
                 st.sidebar.info(
@@ -1647,6 +2063,7 @@ if active_decks:
                 allineati = 0
                 for k, d in active_decks.items():
                     y_for_cut = d['y']
+                    fase_rate, tempo_fase = 1.0, d['tempo']  # scala/tempo con cui leggere il primo beat del deck
                     # Allineo il BPM reale del follower a quello del leader solo se: l'utente lo ha
                     # attivato, siamo in sotto-modo BPM (ha senso solo con un riferimento numerico),
                     # non è il leader stesso, e il follower ha un BPM effettivo valido da cui partire.
@@ -1655,7 +2072,14 @@ if active_decks:
                         with st.spinner(f"Allineo BPM Deck {k.upper()} al leader (rate {rate:.3f}x)..."):
                             y_for_cut = time_stretch_stereo(d['y'], rate)
                         allineati += 1
-                    segs = apply_cut_lengths(y_for_cut, lengths)
+                        fase_rate, tempo_fase = rate, leader_d['tempo']
+                    # Ogni deck parte dal proprio primo beat: i tagli del leader cadono cosi' sui
+                    # beat anche dei follower (solo in sotto-modo BPM; con gli onset la fase non c'entra).
+                    fase = (
+                        fase_deck(d, tempo_fase, d['sr'], fase_rate, usa_downbeat)
+                        if leader_mode == "bpm" else 0
+                    )
+                    segs = apply_cut_lengths(y_for_cut, lengths, start_offset=fase)
                     if not segs:
                         follower_vuoti.append(k.upper())
                     for s in segs:
@@ -1846,9 +2270,9 @@ if active_decks:
             compressione_ratio = st.sidebar.slider("Rapporto (ratio):", 1.5, 8.0, 4.0, step=0.5)
 
         seed_input = st.sidebar.number_input(
-            "🎲 Seed (0 = casuale ogni volta)", min_value=0, value=0, step=1,
-            help="Imposta un numero per rendere il mix riproducibile. Il seed usato viene "
-                 "salvato nel preset scaricabile, così puoi ritrovare un mix riuscito per caso."
+            "🎲 Seed mix (0 = casuale ogni volta)", min_value=0, value=0, step=1,
+            help="Rende riproducibile la scelta e il piazzamento dei frammenti. Il seed usato viene "
+                 "salvato nel preset scaricabile (insieme al seed del taglio), così puoi ritrovare un mix riuscito per caso."
         )
 
         modalita_anteprima = st.sidebar.checkbox(
@@ -1921,17 +2345,25 @@ if active_decks:
                         overlay_pool = []
                         decks_allineati = set()
                         decks_non_allineabili = set()
+                        pool_per_deck = {}
                         for s in overlay_pool_raw:
-                            seg_audio = s['audio']
+                            pool_per_deck.setdefault(s['deck'], []).append(s)
+                        for dk, segs_dk in pool_per_deck.items():
+                            audios_dk = [s['audio'] for s in segs_dk]
                             if dj_bpm_align and dj_leader_d['tempo'] > 0:
-                                follower_tempo = active_decks.get(s['deck'], {}).get('tempo', 0)
+                                # Il tempo del follower resta nel dict del deck anche se la RAM e' stata
+                                # liberata (active_decks lo escluderebbe e lo farebbe sembrare "senza BPM").
+                                follower_tempo = st.session_state.decks.get(dk, {}).get('tempo', 0)
                                 if follower_tempo > 0 and abs(dj_leader_d['tempo'] - follower_tempo) > 0.5:
                                     rate = dj_leader_d['tempo'] / follower_tempo
-                                    seg_audio = time_stretch_stereo(seg_audio, rate)
-                                    decks_allineati.add(s['deck'])
+                                    # Stretch del deck a blocchi (una volta per deck), non per frammento.
+                                    with st.spinner(f"Allineo BPM Deck {dk.upper()} al leader (rate {rate:.3f}x)..."):
+                                        audios_dk = stretch_segments_in_blocks(audios_dk, rate, ref_sr)
+                                    decks_allineati.add(dk)
                                 elif follower_tempo <= 0:
-                                    decks_non_allineabili.add(s['deck'])
-                            overlay_pool.append({'audio': seg_audio, 'sr': ref_sr, 'deck': s['deck']})
+                                    decks_non_allineabili.add(dk)
+                            for a in audios_dk:
+                                overlay_pool.append({'audio': a, 'sr': ref_sr, 'deck': dk})
 
                         # --- Pre-calcolo dell'attacco più forte di ogni segmento, una volta sola,
                         # cosi' il beatmatching non deve rifare la detection ad ogni piazzamento
@@ -1965,6 +2397,8 @@ if active_decks:
                                 loop_roll_probability=dj_loop_roll_prob,
                                 loop_roll_repeats=dj_loop_roll_repeats,
                                 echo_probability=dj_echo_prob,
+                                precomputed_beat_grid=dj_leader_d.get('beats') or None,
+                                downbeat_phase=dj_leader_d.get('downbeat_phase') if usa_downbeat else None,
                             )
                         chosen = [True]  # solo per riusare il check "if not chosen" sotto
 
@@ -1996,7 +2430,8 @@ if active_decks:
 
                     chosen = []
                     curr_samples = 0
-                    target_samples = (15 if modalita_anteprima else durata_mix) * ref_sr
+                    target_samples = int((15 if modalita_anteprima else durata_mix) * ref_sr)
+                    crossfade_samples = int(ref_sr * crossfade_ms / 1000) if apply_crossfade else 0
                     dj_events = []  # riuso lo stesso nome del ramo DJ Remix per il MIDI
 
                     # Peso effettivo per segmento: peso_deck diviso per quanti segmenti quel deck
@@ -2021,16 +2456,26 @@ if active_decks:
                         # che su un array (2, n) restituirebbe 2 (il numero di canali) invece della durata.
                         seg_len = pick['audio'].shape[1]
                         if seg_len > 0:
-                            dj_events.append((curr_samples, pick['deck']))  # posizione nel mix finale
+                            # Ogni giunzione con crossfade SOVRAPPONE i due segmenti: il mix si accorcia
+                            # di `overlap` campioni. Senza contarlo, con centinaia di tagli la durata
+                            # reale finiva diversi secondi sotto il target (e gli eventi MIDI sfasati).
+                            overlap = min(crossfade_samples, seg_len, curr_samples) if chosen else 0
+                            dj_events.append((curr_samples - overlap, pick['deck']))  # posizione nel mix finale
                             chosen.append(pick['audio'])
-                            curr_samples += seg_len
+                            curr_samples += seg_len - overlap
                         attempts += 1
 
                     if chosen:
                         # Concatenazione lungo l'asse temporale, con crossfade opzionale per
                         # evitare i click secchi tra un segmento e il successivo.
-                        crossfade_samples = int(ref_sr * crossfade_ms / 1000) if apply_crossfade else 0
                         final_y = concat_with_crossfade(chosen, crossfade_samples)
+                        # L'ultimo segmento poteva sforare il target: taglio alla durata richiesta con
+                        # una dissolvenza brevissima (5ms) per non lasciare un click in coda al file.
+                        if final_y.shape[1] > target_samples > 0:
+                            final_y = final_y[:, :target_samples].copy()
+                            fade_n = min(int(ref_sr * 0.005), final_y.shape[1])
+                            if fade_n > 1:
+                                final_y[:, -fade_n:] *= np.linspace(1.0, 0.0, fade_n)
                         eventi_piazzati = len(chosen)
 
                 if not chosen:
@@ -2052,8 +2497,9 @@ if active_decks:
                     # --- PRESET RIPRODUCIBILE (seed + parametri) ---
                     preset = {
                         "loop507_hyper_mixer_preset": True,
-                        "versione_app": "5.4",
+                        "versione_app": APP_VERSION,
                         "seed": seed_used,
+                        "seed_taglio": st.session_state.get('cut_seed_used'),
                         "modalita_taglio": tipo_taglio,
                         "parametro_taglio": taglio_meta,
                         "dj_remix": {
@@ -2068,8 +2514,28 @@ if active_decks:
                             "key_check": dj_key_check,
                             "bass_swap": dj_bass_swap,
                             "bass_cutoff_hz": dj_bass_cutoff if dj_bass_swap else None,
+                            "hpss": dj_hpss_mode,
+                            "backspin_prob": dj_reverse_prob,
+                            "loop_roll_prob": dj_loop_roll_prob,
+                            "loop_roll_repeats": dj_loop_roll_repeats if dj_loop_roll_prob > 0 else None,
+                            "echo_prob": dj_echo_prob,
                         } if apply_dj_remix else None,
                         "crossfade_ms": crossfade_ms if (apply_crossfade and not apply_dj_remix) else 0,
+                        "compressione": {
+                            "attiva": apply_compressione,
+                            "soglia_db": compressione_soglia if apply_compressione else None,
+                            "ratio": compressione_ratio if apply_compressione else None,
+                        },
+                        "anteprima": modalita_anteprima,
+                        "usa_downbeat": usa_downbeat,
+                        "preparazione_audio": {
+                            "correggi_ottava": correggi_ottava,
+                            "range_bpm": list(bpm_range_plausibile) if correggi_ottava else None,
+                            "trim_silenzio": trim_silenzio,
+                            "trim_soglia_db": trim_soglia_db if trim_silenzio else None,
+                            "normalizza_lufs": normalizza_loudness,
+                            "target_lufs": target_lufs if normalizza_loudness else None,
+                        },
                         "pesi_deck": deck_weights,
                         "durata_mix_sec": round(durata_effettiva, 2),
                         "deck": [
@@ -2077,9 +2543,11 @@ if active_decks:
                             for k, d in active_decks.items()
                         ],
                         "nota": (
-                            "Per riprovare a riottenere questo stesso mix: ricarica gli stessi file "
-                            "negli stessi deck, imposta la stessa modalità/parametro di taglio e gli "
-                            "stessi pesi, poi inserisci questo seed prima di generare."
+                            "Per riottenere questo stesso mix: ricarica gli stessi file negli stessi "
+                            "deck con la stessa preparazione audio, imposta la stessa modalità/parametro "
+                            "di taglio, inserisci 'seed_taglio' nel campo Seed taglio e rifai il taglio "
+                            "(se seed_taglio è null la modalità non usa casualità), poi imposta gli "
+                            "stessi pesi e inserisci 'seed' nel campo Seed mix prima di generare."
                         )
                     }
                     st.session_state.mix_preset = json.dumps(preset, ensure_ascii=False, indent=2)
@@ -2103,21 +2571,46 @@ if active_decks:
                         if dj_bass_swap:
                             sperimentale_bits_it.append(f"EQ Bass Swap (taglio sotto {dj_bass_cutoff}Hz)")
                             sperimentale_bits_en.append(f"EQ Bass Swap (cut below {dj_bass_cutoff}Hz)")
+                        if dj_hpss_mode:
+                            sperimentale_bits_it.append(f"Isolamento HPSS ({dj_hpss_mode})")
+                            sperimentale_bits_en.append(f"HPSS isolation ({dj_hpss_mode})")
+                        if dj_reverse_prob > 0:
+                            sperimentale_bits_it.append(f"Backspin {dj_reverse_prob:.0%}")
+                            sperimentale_bits_en.append(f"Backspin {dj_reverse_prob:.0%}")
+                        if dj_loop_roll_prob > 0:
+                            sperimentale_bits_it.append(f"Loop Roll {dj_loop_roll_prob:.0%} x{dj_loop_roll_repeats}")
+                            sperimentale_bits_en.append(f"Loop Roll {dj_loop_roll_prob:.0%} x{dj_loop_roll_repeats}")
+                        if dj_echo_prob > 0:
+                            sperimentale_bits_it.append(f"Beat FX Echo {dj_echo_prob:.0%}")
+                            sperimentale_bits_en.append(f"Beat FX Echo {dj_echo_prob:.0%}")
                         sperimentale_info_it = f" / {' / '.join(sperimentale_bits_it)}" if sperimentale_bits_it else ""
                         sperimentale_info_en = f" / {' / '.join(sperimentale_bits_en)}" if sperimentale_bits_en else ""
                         processo_it = f"DJ Remix: Deck {dj_leader_key.upper()} intatto come base / {eventi_piazzati} overlay sparsi (seed {seed_used}){allineamento_info}{beatmatch_info}{sperimentale_info_it} / Stereo Preservato"
                         processo_en = f"DJ Remix: Deck {dj_leader_key.upper()} kept intact as base / {eventi_piazzati} scattered overlays (seed {seed_used}){sperimentale_info_en} / Stereo Preserved"
                         extra_it = f"* Deck Base (intatto): {dj_leader_key.upper()}\n* Overlay Piazzati: {eventi_piazzati} (volume {overlay_gain:.2f}x)\n* Allineamento BPM: {'attivo' if dj_bpm_align else 'disattivo'}\n* Beatmatching: {'attivo' if dj_beatmatch else 'disattivo'}\n* Aggancio a frasi: {f'{dj_beats_per_phrase} battute' if dj_phrase_match else 'disattivo'}\n* EQ Bass Swap: {f'sotto {dj_bass_cutoff}Hz' if dj_bass_swap else 'disattivo'}\n* Compressione Finale: {f'soglia {compressione_soglia}dB, ratio {compressione_ratio}' if apply_compressione else 'disattivata'}"
                         extra_en = f"* Base Deck (intact): {dj_leader_key.upper()}\n* Overlays Placed: {eventi_piazzati} (gain {overlay_gain:.2f}x)\n* BPM Alignment: {'on' if dj_bpm_align else 'off'}\n* Beatmatching: {'on' if dj_beatmatch else 'off'}\n* Phrase Matching: {f'{dj_beats_per_phrase} beats' if dj_phrase_match else 'off'}\n* EQ Bass Swap: {f'below {dj_bass_cutoff}Hz' if dj_bass_swap else 'off'}\n* Final Compression: {f'threshold {compressione_soglia}dB, ratio {compressione_ratio}' if apply_compressione else 'disabled'}"
+                        extra_it += (
+                            f"\n* HPSS: {dj_hpss_mode or 'disattivo'}"
+                            f"\n* Backspin: {f'{dj_reverse_prob:.0%}' if dj_reverse_prob > 0 else 'disattivo'}"
+                            f"\n* Loop Roll: {f'{dj_loop_roll_prob:.0%} x{dj_loop_roll_repeats}' if dj_loop_roll_prob > 0 else 'disattivo'}"
+                            f"\n* Beat FX Echo: {f'{dj_echo_prob:.0%}' if dj_echo_prob > 0 else 'disattivo'}"
+                        )
+                        extra_en += (
+                            f"\n* HPSS: {dj_hpss_mode or 'off'}"
+                            f"\n* Backspin: {f'{dj_reverse_prob:.0%}' if dj_reverse_prob > 0 else 'off'}"
+                            f"\n* Loop Roll: {f'{dj_loop_roll_prob:.0%} x{dj_loop_roll_repeats}' if dj_loop_roll_prob > 0 else 'off'}"
+                            f"\n* Beat FX Echo: {f'{dj_echo_prob:.0%}' if dj_echo_prob > 0 else 'off'}"
+                        )
                     else:
                         processo_it = f"Shuffling Ricorsivo (seed {seed_used}) / Cross-Deck Fragmentation / Sample Rate Uniformato / Stereo Preservato / Pesi Deck Personalizzati"
                         processo_en = f"Recursive Shuffling (seed {seed_used}) / Cross-Deck Fragmentation / Uniform Sample Rate / Stereo Preserved / Custom Deck Weights"
                         extra_it = f"* Crossfade: {f'{crossfade_ms}ms' if apply_crossfade else 'disattivato'}\n* Compressione Finale: {f'soglia {compressione_soglia}dB, ratio {compressione_ratio}' if apply_compressione else 'disattivata'}"
                         extra_en = f"* Crossfade: {f'{crossfade_ms}ms' if apply_crossfade else 'disabled'}\n* Final Compression: {f'threshold {compressione_soglia}dB, ratio {compressione_ratio}' if apply_compressione else 'disabled'}"
 
+                    cut_seed_txt = st.session_state.get('cut_seed_used') or "—"
                     st.session_state.audio_report = f"""
 ╔════════════════════════════════════════════════════════════════╗
-  HYPER-MIXER v5.4 - AUDIO RECONSTRUCTION LOG (STEREO + DJ REMIX + MIDI)
+  HYPER-MIXER v{APP_VERSION} - AUDIO RECONSTRUCTION LOG (STEREO + DJ REMIX + MIDI)
   Generated on: {ts_audio}
 ╚════════════════════════════════════════════════════════════════╝
 
@@ -2125,7 +2618,7 @@ if active_decks:
 
 ═══════════════════ ITALIANO ═══════════════════
 
-:: ENGINE: hyper_mixer_loop507 [v5.4]
+:: ENGINE: hyper_mixer_loop507 [v{APP_VERSION}]
 :: ANALISI: Beat Tracking (Librosa) / RMS Envelope / Onset Detection
 :: STILE: Audio-Glitch / Granular Synthesis
 :: PROCESSO: {processo_it}
@@ -2139,11 +2632,12 @@ if active_decks:
 * Campionamento: {ref_sr} Hz / Stereo (L/R preservati, mono duplicato se sorgente mono)
 {extra_it}
 * Seed: {seed_used}
+* Seed Taglio: {cut_seed_txt}
 * Durata Output: {durata_effettiva:.1f}s
 
 ═══════════════════ ENGLISH ═══════════════════
 
-:: ENGINE: hyper_mixer_loop507 [v5.4]
+:: ENGINE: hyper_mixer_loop507 [v{APP_VERSION}]
 :: ANALYSIS: Beat Tracking (Librosa) / RMS Envelope / Onset Detection
 :: STYLE: Audio-Glitch / Granular Synthesis
 :: PROCESS: {processo_en}
@@ -2157,6 +2651,7 @@ if active_decks:
 * Sampling: {ref_sr} Hz / Stereo (L/R preserved, mono duplicated if source was mono)
 {extra_en}
 * Seed: {seed_used}
+* Cut Seed: {cut_seed_txt}
 * Output Duration: {durata_effettiva:.1f}s
 
 > Regia e Algoritmo / Direction & Algorithm: Loop507
@@ -2219,4 +2714,4 @@ if st.session_state.get('mix_ready'):
             st.caption("🖼️ Immagine onda non disponibile: aggiungi 'matplotlib' a requirements.txt.")
 
 st.markdown("---")
-st.caption("Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva | Stereo + DJ Remix + Preparazione Audio + Waveform v5.5")
+st.caption(f"Loop507 Hyper-Mixer | Modalità Glitch & BPM attiva | Stereo + DJ Remix + Preparazione Audio + Waveform v{APP_VERSION}")
