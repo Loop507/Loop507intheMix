@@ -7,5 +7,5 @@ scipy
 pyloudnorm
 matplotlib
 mutagen
-aubio
 audiocomplib
+soundfile
