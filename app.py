@@ -76,7 +76,7 @@ MIN_SEGMENT_SAMPLES = 256          # ~5ms a 44.1kHz, evita segmenti a lunghezza 
 MAX_SEGMENT_SECONDS = 30           # tetto di sicurezza per singolo segmento
 
 # Versione unica dell'app: usata in preset, report e footer (prima era sparsa in 3 punti con valori diversi)
-APP_VERSION = "5.9"
+APP_VERSION = "5.10"
 DOWNBEAT_MIN_CONFIDENCE = 0.15  # sotto questa confidenza la stima del downbeat viene scartata
 
 # --- Funzioni di Analisi e Taglio ---
@@ -1419,7 +1419,8 @@ def invalidate_mix():
     st.session_state.pop("mix_events_sr", None)
     st.session_state.pop("mix_events_tempo", None)
     for _k in ("mix_placements", "mix_leader", "mix_total_samples", "mix_dry_peak", "mix_deck_names",
-               "mix_key_nome", "mix_sections_sec", "mix_downbeat_sec", "mix_wav24", "mix_stems_zip"):
+               "mix_key_nome", "mix_sections_sec", "mix_downbeat_sec", "mix_wav24", "mix_stems_zip",
+               "mix_midi_trascritto", "mix_midi_conteggi", "mix_tempo_noto"):
         st.session_state.pop(_k, None)
     st.session_state.pop("dj_rendered_by_deck", None)
     st.session_state.pop("mix_is_preview", None)
@@ -2069,6 +2070,403 @@ def build_waveform_image(final_y, sr, events=None, title="Loop507 Mix", placemen
         return buffer
     except Exception:
         return None
+
+
+
+# =====================================================================================
+# v5.10: MIDI TRASCRITTO DALL'AUDIO DEL MIX (batteria + basso + armonia), solo DSP
+# =====================================================================================
+# Note General MIDI per la batteria (canale 10)
+GM_KICK, GM_SNARE, GM_HAT_CLOSED, GM_HAT_OPEN = 36, 38, 42, 46
+SR_TRASCRIZIONE = 22050  # le bande che servono (basso, medi, hi-hat fino a ~10kHz) stanno sotto 11kHz
+
+
+_BANDE_TRASC = [(30, 120), (120, 300), (300, 1200), (1200, 3500), (3500, 6500), (6500, 10000)]
+
+
+def _band_features(y, sr, n_fft=1024, hop=256):
+    """Energia (potenza lineare) in 6 bande per ogni frame, calcolata a BLOCCHI: la STFT intera di un brano pesa centinaia di MB.
+    Bande: 30-120 / 120-300 / 300-1200 / 1200-3500 / 3500-6500 / 6500-10000 Hz."""
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    idx = [np.where((freqs >= lo) & (freqs < hi))[0] for lo, hi in _BANDE_TRASC]
+    chunk = 2048
+    E = []
+    n_frames = 1 + max(0, (len(y) - n_fft) // hop)
+    for f0 in range(0, n_frames, chunk):
+        a = f0 * hop
+        seg = y[a:a + (chunk - 1) * hop + n_fft]
+        if len(seg) < n_fft:
+            break
+        S = np.abs(librosa.stft(seg.astype(np.float32), n_fft=n_fft, hop_length=hop, center=False)) ** 2
+        E.append(np.stack([S[ix].sum(axis=0) for ix in idx]))
+    if not E:
+        return {}
+    return {'E': np.concatenate(E, axis=1), 'fps': sr / hop, 't0': (n_fft * 0.5) / sr}
+
+
+def transcribe_drums(y, sr, sensibilita=5):
+    """Batteria dal suono del mix: kick, rullante, hi-hat chiuso/aperto -> [(sec, nota GM, velocity)].
+    1) ONSET: funzione di novita' = somma, sulle 6 bande, del flusso positivo dell'energia
+       (log-compressa e normalizzata per banda); picchi sopra una frazione del 95° percentile.
+    2) CLASSIFICAZIONE sull'aumento di energia LINEARE a ogni attacco (dopo - prima), cioe' su
+       'cosa e' stato aggiunto' e non su cio' che gia' suonava (basso, pad):
+       - KICK: l'aumento sta soprattutto nelle bande 30-300Hz e l'energia bassa decade in meno
+         di ~0.2s (un'altra nota di basso, che si sostiene, non e' un kick);
+       - HI-HAT: l'aumento sopra i 300Hz e' concentrato nelle bande 3.5-10kHz (>= 75%);
+         APERTO se quell'energia resta sopra il 30% del picco per piu' di ~100ms;
+       - RULLANTE/CLAP: l'aumento sopra i 300Hz e' rumoroso (flatness >= 0.10) e ha una quota
+         significativa nei medi 300Hz-3.5kHz, senza essere un hi-hat.
+       Le parti 'basse' e 'alte' si valutano separatamente: kick e rullante insieme danno due note.
+    `sensibilita` 1-10: piu' alta = soglia piu' bassa = piu' colpi."""
+    f = _band_features(y, sr)
+    if not f or f['E'].shape[1] < 16:
+        return []
+    E, fps, t0 = f['E'], f['fps'], f['t0']
+    nb, nf = E.shape
+    # novita': flusso positivo della banda log-compressa e normalizzata sul suo 95° percentile
+    L = np.log1p(20.0 * E / (np.percentile(E, 95, axis=1, keepdims=True) + 1e-12))
+    odf = np.maximum(0.0, np.diff(L, axis=1, prepend=L[:, :1])).sum(axis=0)
+    attivi = odf[odf > 0]
+    if len(attivi) < 8:
+        return []
+    frac = float(np.interp(sensibilita, [1, 5, 10], [0.50, 0.28, 0.12]))
+    from scipy.signal import find_peaks
+    picchi, _ = find_peaks(odf, height=frac * float(np.percentile(attivi, 95)), distance=max(1, int(0.045 * fps)))
+    # Gli hi-hat sono molto piu' deboli di kick e rullante: con una soglia unica sulla novita'
+    # complessiva verrebbero scartati. Cerco quindi gli attacchi anche sulla sola novita' delle
+    # bande alte (3.5-10kHz), con la sua soglia, e unisco i due insiemi (niente doppioni a < 30ms).
+    odf_h = np.maximum(0.0, np.diff(L[4:], axis=1, prepend=L[4:, :1])).sum(axis=0)
+    att_h = odf_h[odf_h > 0]
+    if len(att_h) >= 8:
+        ph, _ = find_peaks(odf_h, height=frac * float(np.percentile(att_h, 90)), distance=max(1, int(0.045 * fps)))
+        extra = [p for p in ph if not any(abs(int(p) - int(q)) <= int(0.03 * fps) for q in picchi)]
+        picchi = np.array(sorted(set(int(q) for q in picchi) | set(int(p) for p in extra)))
+    if len(picchi) == 0:
+        return []
+    # Per ogni attacco: energia PRIMA e DOPO in ogni banda (lineare)
+    pre = np.zeros((nb, len(picchi)))
+    post = np.zeros((nb, len(picchi)))
+    for n, p in enumerate(picchi):
+        pre[:, n] = E[:, max(0, p - 3):max(1, p - 1)].mean(axis=1) if p > 1 else E[:, 0]
+        post[:, n] = E[:, p:min(nf, p + 3)].max(axis=1)
+    dE = np.maximum(0.0, post - pre)
+    eps = 1e-12
+    # L'attacco deve ALZARE l'energia della sua banda di almeno ~4dB rispetto a cio' che gia'
+    # suonava (x2.5 in potenza; x2 per il kick): scarta le fluttuazioni di un fondo rumoroso.
+    rel_low = (post[0] + post[1]) / (pre[0] + pre[1] + eps)
+    rel_mid = (post[2] + post[3]) / (pre[2] + pre[3] + eps)
+    rel_hi = (post[4] + post[5]) / (pre[4] + pre[5] + eps)
+    low = dE[0] + dE[1]
+    mid_inc = dE[2] + dE[3]
+    hi_inc = dE[4] + dE[5]
+    e_low = E[0] + E[1]
+    e_hi = E[4] + E[5]
+    n_fft, hop = 1024, 256
+    fr = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    bins_mid = np.where((fr >= 300) & (fr < 3500))[0]
+    bins_hi = np.where((fr >= 3500) & (fr < 10000))[0]
+    finestra = np.hanning(n_fft)
+
+    def flatness_aggiunta(p, bins):
+        """Flatness (1 = rumore bianco, ~0 = pochi picchi tonali) dello spettro AGGIUNTO
+        dall'attacco (potenza dopo - prima) nelle bande indicate. Misurarla sull'aumento e
+        non sul suono intero evita che un fondo rumoroso faccia sembrare 'rumoroso' un synth."""
+        a_post = (p + 2) * hop
+        a_pre = max(0, (p - 3) * hop)
+        if a_post + n_fft > len(y):
+            return 0.0
+        X_post = np.abs(np.fft.rfft(y[a_post:a_post + n_fft] * finestra)) ** 2
+        X_pre = np.abs(np.fft.rfft(y[a_pre:a_pre + n_fft] * finestra)) ** 2
+        d = np.maximum(0.0, X_post - X_pre)[bins]
+        if d.max() <= 0:
+            return 0.0
+        d = d + 1e-3 * d.max()
+        return float(np.exp(np.mean(np.log(d))) / np.mean(d))
+
+    def decadimento(e, p, frazione):
+        pk = e[p:min(nf, p + 4)].max()
+        dopo = e[p + 1:p + 1 + int(0.30 * fps)]
+        sotto = np.where(dopo < frazione * pk)[0]
+        return (sotto[0] if len(sotto) else len(dopo)) / fps
+
+    # PASSO 1 - candidati per classe. La soglia d'ampiezza di ogni classe e' relativa alla
+    # distribuzione DELLA CLASSE STESSA (un hi-hat e' molto piu' debole di un rullante).
+    cand_kick, cand_hat, cand_snare = [], [], []
+    for n, p in enumerate(picchi):
+        p = int(p)
+        if (low[n] > 0 and rel_low[n] >= 2.0 and low[n] >= 0.5 * (mid_inc[n] + hi_inc[n] + eps)
+                and decadimento(e_low, p, 0.25) <= 0.20):
+            cand_kick.append(n)
+        rapporto = hi_inc[n] / (mid_inc[n] + eps)  # alti/medi: un hi-hat sposta l'energia verso gli alti piu' di un rullante
+        f_mid = flatness_aggiunta(p, bins_mid) if mid_inc[n] > 0 else 0.0
+        f_hi = flatness_aggiunta(p, bins_hi) if hi_inc[n] > 0 else 0.0
+        # RULLANTE: l'aumento nei medi e' RUMOROSO, e il rumore sale anche negli alti (le casse
+        # del rullante arrivano a 5-10kHz): un aumento solo nei medi e' un synth/voce, non un rullante.
+        if mid_inc[n] > 0 and rel_mid[n] >= 2.5 and 0.15 <= rapporto < 4.0 and rel_hi[n] >= 1.5 and f_mid >= 0.25:
+            cand_snare.append(n)
+        # HI-HAT: aumento rumoroso negli alti. Se nei medi c'e' un aumento TONALE (una nota di synth
+        # che cade sullo stesso battito) non conta contro l'hi-hat: il rapporto alti/medi si
+        # valuta solo quando anche i medi sono rumorosi (cioe' potrebbe essere un rullante).
+        if hi_inc[n] > 0 and rel_hi[n] >= 2.5 and f_hi >= 0.25 and (rapporto >= 4.0 or f_mid < 0.25):
+            cand_hat.append(n)
+    eventi = []
+    soglia_kick = float(np.interp(sensibilita, [1, 5, 10], [0.60, 0.40, 0.20]))
+    soglia_snare = float(np.interp(sensibilita, [1, 5, 10], [0.55, 0.35, 0.15]))
+
+    def velocita(v, ref):
+        # scala in dB: 0 dB (= 90° percentile della classe) -> 127, -24 dB -> 35
+        db = 10.0 * np.log10(max(v / ref, 1e-6))
+        return int(max(35, min(127, 35 + 92 * np.clip((db + 24.0) / 24.0, 0.0, 1.0))))
+
+    if cand_kick:
+        ref = float(np.percentile(low[cand_kick], 90)) + eps
+        for n in cand_kick:
+            if low[n] >= soglia_kick * ref:
+                eventi.append((t0 + picchi[n] / fps, GM_KICK, velocita(low[n], ref)))
+    if cand_snare:
+        ref = float(np.percentile(mid_inc[cand_snare], 90)) + eps
+        for n in cand_snare:
+            if mid_inc[n] >= soglia_snare * ref:
+                eventi.append((t0 + picchi[n] / fps, GM_SNARE, velocita(mid_inc[n], ref)))
+    if cand_hat:
+        ref = float(np.percentile(hi_inc[cand_hat], 90)) + eps
+        for n in cand_hat:
+            if hi_inc[n] >= 0.03 * ref:
+                durata = decadimento(e_hi, int(picchi[n]), 0.30)
+                eventi.append((t0 + picchi[n] / fps, GM_HAT_OPEN if durata > 0.10 else GM_HAT_CLOSED,
+                               velocita(hi_inc[n], ref)))
+    eventi.sort(key=lambda e: e[0])
+    return eventi
+
+
+def transcribe_bass(y, sr, kick_times=None):
+    """Basso monofonico dal suono del mix -> [(start_s, durata_s, nota MIDI, velocity)].
+    Passa-basso a 260Hz, pitch con YIN (algoritmo classico, niente ML), nota = f0 arrotondata,
+    mediana su 7 frame, note solo se la zona e' energica e stabile per almeno ~80ms. Un kick
+    ha un glide verso il basso che YIN scambia per una nota breve: scarto le note brevi
+    (< 160ms) che partono sull'attacco di un kick."""
+    try:
+        from scipy.signal import butter, sosfiltfilt
+        from scipy.ndimage import median_filter
+        sos = butter(4, 260.0, btype='lowpass', fs=sr, output='sos')
+        yl = sosfiltfilt(sos, y.astype(np.float64)).astype(np.float32)
+        hop = 256
+        f0 = librosa.yin(yl, fmin=32.0, fmax=260.0, sr=sr, frame_length=2048, hop_length=hop)
+        rms = librosa.feature.rms(y=yl, frame_length=2048, hop_length=hop)[0]
+        n = min(len(f0), len(rms))
+        f0, rms = f0[:n], rms[:n]
+        gate = 0.12 * float(np.percentile(rms, 95))
+        voiced = (rms > gate) & (f0 > 30) & (f0 < 270)
+        midi = np.where(voiced, np.round(librosa.hz_to_midi(np.maximum(f0, 1.0))), -1).astype(int)
+        midi = median_filter(midi, size=7, mode='nearest')
+        fps = sr / hop
+        note, i = [], 0
+        while i < n:
+            if midi[i] < 0:
+                i += 1
+                continue
+            j = i
+            while j + 1 < n and midi[j + 1] == midi[i]:
+                j += 1
+            # unisco micro-buchi (<= 2 frame) tra due run della stessa nota
+            while j + 3 < n and midi[j + 1] < 0 and midi[j + 2] == midi[i] or (j + 3 < n and midi[j + 1] < 0 and midi[j + 3] == midi[i] and midi[j + 2] < 0 and False):
+                j += 2
+                while j + 1 < n and midi[j + 1] == midi[i]:
+                    j += 1
+            dur = (j - i + 1) / fps
+            if dur >= 0.08:
+                t = i / fps
+                v = int(max(40, min(120, 40 + 80 * min(1.0, float(np.mean(rms[i:j + 1])) / (float(np.percentile(rms, 95)) + 1e-9)))))
+                note.append((t, dur, int(midi[i]), v))
+            i = j + 1
+        if kick_times is not None and len(kick_times):
+            kt = np.asarray(kick_times)
+            note = [x for x in note if not (x[1] < 0.16 and np.any((kt > x[0] - 0.03) & (kt < x[0] + 0.06)))]
+        return note
+    except Exception:
+        return []
+
+
+def transcribe_harmony(y, sr, max_voci=4):
+    """Armonia/lead polifonica (STIMA) dal suono del mix -> [(start_s, durata_s, nota MIDI, velocity)].
+    CQT a 36 bin/ottava (C3-C7) raggruppata a semitoni, mediana nel tempo (tiene il sostenuto,
+    scarta i colpi percussivi), fino a `max_voci` picchi per frame sopra una soglia relativa,
+    con soppressione delle ARMONICHE (un picco a +12/+19/+24 semitoni da uno piu' forte e'
+    quasi sempre una sua armonica, non una nota) e durata minima ~140ms. La trascrizione
+    polifonica da audio mixato e' un problema aperto: aspettati note sbagliate/mancanti, utile
+    come bozza da correggere nel DAW, non come partitura."""
+    try:
+        from scipy.ndimage import median_filter
+        hop = 512
+        fmin = librosa.note_to_hz('C3')
+        C = np.abs(librosa.cqt(y.astype(np.float32), sr=sr, hop_length=hop, fmin=fmin,
+                               n_bins=144, bins_per_octave=36))
+        n_f = C.shape[1]
+        sem = C.reshape(48, 3, n_f).max(axis=1)           # 48 semitoni: MIDI 48..95
+        sem = median_filter(sem, size=(1, 9), mode='nearest')
+        floor = 0.06 * float(sem.max()) + 1e-12
+        A = np.zeros_like(sem, dtype=bool)
+        for t in range(n_f):
+            col = sem[:, t]
+            fm = col.max()
+            if fm < floor:
+                continue
+            cand = [i for i in range(1, 47) if col[i] > col[i - 1] and col[i] >= col[i + 1] and col[i] >= 0.35 * fm]
+            cand.sort(key=lambda i: -col[i])
+            scelti = []
+            for i in cand:
+                if any((i - s) in (12, 19, 24, 28) and col[i] < 0.8 * col[s] for s in scelti):
+                    continue  # armonica di una nota piu' forte
+                scelti.append(i)
+                if len(scelti) >= max_voci:
+                    break
+            for i in scelti:
+                A[i, t] = True
+        fps = sr / hop
+        out = []
+        for i in range(48):
+            r = A[i].copy()
+            # chiudo i buchi di 1 frame
+            for t in range(1, n_f - 1):
+                if not r[t] and r[t - 1] and r[t + 1]:
+                    r[t] = True
+            t = 0
+            while t < n_f:
+                if not r[t]:
+                    t += 1
+                    continue
+                u = t
+                while u + 1 < n_f and r[u + 1]:
+                    u += 1
+                dur = (u - t + 1) / fps
+                if dur >= 0.14:
+                    ampl = float(np.mean(sem[i, t:u + 1])) / (float(sem.max()) + 1e-12)
+                    out.append((t / fps, dur, 48 + i, int(max(40, min(115, 40 + 90 * min(1.0, ampl * 1.4))))))
+                t = u + 1
+        out.sort(key=lambda e: (e[0], e[2]))
+        return out
+    except Exception:
+        return []
+
+
+def build_transcribed_midi(drums, bass, harmony, tempo_bpm, key_nome=None, markers=None,
+                           downbeat_sec=None, quantize=False, nota_info=""):
+    """MIDI Format 1 per Logic dalle note trascritte: conductor (tempo, 4/4, tonalità, marker),
+    traccia Batteria sul CANALE 10 (note General MIDI: kick 36, rullante 38, hi-hat 42/46),
+    traccia Basso e traccia Armonia/Lead. 960 PPQ. Stesse accortezze del MIDI struttura:
+    nomi traccia ASCII, program change a tick 0, note-off prima del note-on allo stesso tick,
+    mai due note-on uguali senza note-off in mezzo. `quantize`: attacchi agganciati alla griglia
+    di 1/16 (se entro il 40% del passo), con origine sul downbeat se noto."""
+    if not MIDI_DISPONIBILE or not (drums or bass or harmony):
+        return None
+    PPQ = 960
+    bpm = max(20.0, min(300.0, float(tempo_bpm or 120.0)))
+    tempo_us = mido.bpm2tempo(bpm)
+    passo = 60.0 / bpm / 4.0
+    origine = float(downbeat_sec) if downbeat_sec is not None else 0.0
+
+    def q(sec):
+        if not quantize:
+            return sec
+        k = round((sec - origine) / passo)
+        agg = origine + k * passo
+        return agg if abs(sec - agg) <= 0.4 * passo else sec
+
+    def ticks(sec):
+        return int(round(mido.second2tick(max(0.0, sec), PPQ, tempo_us)))
+
+    mid = mido.MidiFile(type=1, ticks_per_beat=PPQ)
+    cond = mido.MidiTrack()
+    cond.append(mido.MetaMessage('track_name', name='Loop507 Mix (trascrizione)', time=0))
+    cond.append(mido.MetaMessage('set_tempo', tempo=tempo_us, time=0))
+    cond.append(mido.MetaMessage('time_signature', numerator=4, denominator=4,
+                                 clocks_per_click=24, notated_32nd_notes_per_beat=8, time=0))
+    parsed = parse_tonalita(key_nome) if key_nome else None
+    if parsed:
+        pc, modo = parsed
+        try:
+            cond.append(mido.MetaMessage('key_signature',
+                                         key=(_MIDI_MAGGIORI if modo == 'major' else _MIDI_MINORI)[pc], time=0))
+        except Exception:
+            pass
+    if nota_info:
+        cond.append(mido.MetaMessage('text', text=_ascii_pulito(nota_info, 200), time=0))
+    marc = [(0.0, "Inizio mix")]
+    if downbeat_sec is not None:
+        marc.append((float(downbeat_sec), "Battuta 1 (downbeat leader)"))
+    for sec, nome in (markers or []):
+        marc.append((float(sec), _ascii_pulito(nome, 40)))
+    prev = 0
+    for t, nome in sorted(((ticks(s), n) for s, n in marc), key=lambda e: e[0]):
+        cond.append(mido.MetaMessage('marker', text=nome, time=max(0, t - prev)))
+        prev = t
+    cond.append(mido.MetaMessage('end_of_track', time=0))
+    mid.tracks.append(cond)
+
+    def aggiungi_traccia(nome, canale, programma, eventi):
+        """eventi = [(start_s, durata_s, nota, vel)]"""
+        if not eventi:
+            return
+        tr = mido.MidiTrack()
+        tr.append(mido.MetaMessage('track_name', name=nome, time=0))
+        if programma is not None:
+            tr.append(mido.Message('program_change', channel=canale, program=programma, time=0))
+        per_nota = {}
+        for s, d, n, v in eventi:
+            per_nota.setdefault(n, []).append((q(s), d, v))
+        assoluti = []
+        for n, lst in per_nota.items():
+            lst.sort(key=lambda e: e[0])
+            ticks_on = []
+            for s, d, v in lst:
+                k = ticks(s)
+                if ticks_on and ticks_on[-1][0] == k:
+                    continue  # stesso tick, stessa nota: ne tengo una
+                ticks_on.append((k, s, d, v))
+            for idx, (t_on, s, d, v) in enumerate(ticks_on):
+                t_off = ticks(s + d)
+                if idx + 1 < len(ticks_on):
+                    t_off = max(t_on + 1, min(t_off, ticks_on[idx + 1][0]))
+                else:
+                    t_off = max(t_off, t_on + PPQ // 16)
+                assoluti.append((t_on, 1, mido.Message('note_on', channel=canale, note=int(n), velocity=int(v))))
+                assoluti.append((t_off, 0, mido.Message('note_off', channel=canale, note=int(n), velocity=0)))
+        assoluti.sort(key=lambda e: (e[0], e[1]))
+        prev = 0
+        for t, _o, msg in assoluti:
+            tr.append(msg.copy(time=max(0, t - prev)))
+            prev = t
+        tr.append(mido.MetaMessage('end_of_track', time=0))
+        mid.tracks.append(tr)
+
+    # batteria: durata fissa breve (1/32 di nota), canale 10 (indice 9)
+    aggiungi_traccia("Batteria (GM)", 9, None, [(s, 60.0 / bpm / 8.0, n, v) for s, n, v in drums])
+    aggiungi_traccia("Basso (stima)", 0, 38, bass)
+    aggiungi_traccia("Armonia-Lead (stima)", 1, 80, harmony)
+    out = BytesIO()
+    mid.save(file=out)
+    out.seek(0)
+    return out
+
+
+def trascrivi_mix(y_mono, sr, tempo_bpm, key_nome=None, markers=None, downbeat_sec=None,
+                  sensibilita=5, con_basso=True, con_armonia=True, quantize=False, nota_info=""):
+    """Pipeline completa: batteria, basso (se richiesto), armonia (se richiesta) -> (BytesIO MIDI, conteggi)."""
+    drums = transcribe_drums(y_mono, sr, sensibilita)
+    kick_t = [t for t, n, _v in drums if n == GM_KICK]
+    bass = transcribe_bass(y_mono, sr, kick_t) if con_basso else []
+    harm = transcribe_harmony(y_mono, sr) if con_armonia else []
+    if harm:
+        # Un rullante o un kick hanno un corpo tonale (es. ~190Hz) che la CQT scambia per una nota:
+        # scarto le note BREVI (< 250ms) che partono entro 50ms da un attacco di batteria.
+        colpi = np.array([t for t, n, _v in drums if n in (GM_KICK, GM_SNARE)])
+        if len(colpi):
+            harm = [h for h in harm if not (h[1] < 0.25 and np.any(np.abs(colpi - h[0]) <= 0.05))]
+    midi = build_transcribed_midi(drums, bass, harm, tempo_bpm, key_nome, markers, downbeat_sec, quantize, nota_info)
+    conteggi = {'kick': sum(1 for e in drums if e[1] == GM_KICK), 'rullante': sum(1 for e in drums if e[1] == GM_SNARE),
+                'hihat': sum(1 for e in drums if e[1] in (GM_HAT_CLOSED, GM_HAT_OPEN)),
+                'basso': len(bass), 'armonia': len(harm)}
+    return midi, conteggi
 
 
 
@@ -3444,6 +3842,10 @@ if active_decks:
                     st.session_state.mix_sections_sec = mix_sections_sec
                     st.session_state.mix_downbeat_sec = mix_downbeat_sec
                     st.session_state.pop('mix_stems_zip', None)
+                    st.session_state.pop('mix_midi_trascritto', None)
+                    st.session_state.pop('mix_midi_conteggi', None)
+                    # True se il BPM del mix e' noto (leader DJ): altrimenti la trascrizione lo stima dall'audio
+                    st.session_state.mix_tempo_noto = bool(apply_dj_remix and dj_leader_d['tempo'] > 0)
 
                     # --- Immagine forma d'onda: 'foto' di cosa è successo nel mix ---
                     titolo_img = f"Loop507 {'DJ Remix' if apply_dj_remix else 'Hyper-Mixer'}" + (" — ANTEPRIMA" if modalita_anteprima else "")
@@ -3463,6 +3865,59 @@ if st.session_state.get('mix_ready'):
     st.audio(st.session_state.mix_ready)
     if st.session_state.get('mix_waveform_image'):
         st.image(st.session_state.mix_waveform_image, use_container_width=True)
+    # --- MIDI della MUSICA del mix (batteria + basso + armonia), trascritto dall'audio ---
+    if st.session_state.get('mix_ready') is not None:
+        with st.expander("🥁 MIDI della musica del mix (batteria + basso + armonia)", expanded=True):
+            st.caption(
+                "Trascrive dal SUONO del mix finale (non dai deck): batteria su canale 10 (kick, rullante, "
+                "hi-hat chiuso/aperto), basso monofonico e armonia/lead. È una trascrizione automatica solo DSP: "
+                "la batteria è affidabile su ritmi puliti, il basso è buono, l'armonia è una bozza da correggere nel DAW."
+            )
+            _c1, _c2, _c3 = st.columns(3)
+            with _c1:
+                _sens = st.slider("Sensibilità batteria", 1, 10, 5, key="trasc_sens",
+                                  help="Più alta = più colpi rilevati (ma anche più falsi positivi).")
+            with _c2:
+                _con_basso = st.checkbox("Includi basso", value=True, key="trasc_basso")
+                _con_arm = st.checkbox("Includi armonia/lead", value=True, key="trasc_arm")
+            with _c3:
+                _quant = st.checkbox("Quantizza a 1/16", value=False, key="trasc_quant",
+                                     help="Aggancia gli attacchi alla griglia del tempo (se entro il 40% del passo). "
+                                          "Utile se il BPM è giusto; altrimenti lascialo spento e quantizza in Logic.")
+            if st.session_state.get('mix_midi_trascritto') is None:
+                if st.button("🎼 Genera MIDI dal suono del mix", use_container_width=True, key="trasc_btn"):
+                    with st.spinner("Trascrivo batteria, basso e armonia dal mix..."):
+                        _seg = AudioSegment.from_file(BytesIO(st.session_state.mix_ready.getvalue()))
+                        _seg = _seg.set_frame_rate(SR_TRASCRIZIONE).set_channels(1)
+                        _y = np.array(_seg.get_array_of_samples()).astype(np.float32) / float(2 ** (8 * _seg.sample_width - 1))
+                        _bpm = st.session_state.get('mix_events_tempo', 120.0)
+                        if not st.session_state.get('mix_tempo_noto'):
+                            _stima = ioi_tempo_estimate(_y, SR_TRASCRIZIONE)
+                            if _stima:
+                                _bpm = correggi_errore_ottava(_stima, 70, 180)
+                        _midi, _cont = trascrivi_mix(
+                            _y, SR_TRASCRIZIONE, _bpm, key_nome=st.session_state.get('mix_key_nome'),
+                            markers=[(t, f"Sezione {i + 1}") for i, t in enumerate(st.session_state.get('mix_sections_sec') or [])],
+                            downbeat_sec=st.session_state.get('mix_downbeat_sec'), sensibilita=_sens,
+                            con_basso=_con_basso, con_armonia=_con_arm, quantize=_quant,
+                            nota_info=f"Loop507 Hyper-Mixer v{APP_VERSION} - trascrizione dal mix - {_bpm:.2f} BPM")
+                        _cont['bpm'] = _bpm
+                        st.session_state.mix_midi_trascritto = _midi
+                        st.session_state.mix_midi_conteggi = _cont
+                    st.rerun()
+            else:
+                _cont = st.session_state.get('mix_midi_conteggi') or {}
+                st.download_button("🎹 Scarica MIDI del mix (batteria + basso + armonia)",
+                                   st.session_state.mix_midi_trascritto, "loop507_mix_trascritto.mid",
+                                   mime="audio/midi", use_container_width=True)
+                st.caption(f"Trascritti: {_cont.get('kick', 0)} kick, {_cont.get('rullante', 0)} rullanti, "
+                           f"{_cont.get('hihat', 0)} hi-hat, {_cont.get('basso', 0)} note di basso, "
+                           f"{_cont.get('armonia', 0)} note di armonia · tempo {_cont.get('bpm', 0):.1f} BPM")
+                if st.button("↩️ Cambia opzioni e rigenera", key="trasc_reset"):
+                    st.session_state.pop('mix_midi_trascritto', None)
+                    st.session_state.pop('mix_midi_conteggi', None)
+                    st.rerun()
+
     # --- Export per Logic Pro: WAV 24-bit e stem allineati ---
     _pl = st.session_state.get('mix_placements') or []
     _ld = st.session_state.get('mix_leader')
@@ -3524,9 +3979,11 @@ if st.session_state.get('mix_ready'):
                     st.session_state.get('mix_events_sr', TARGET_SR), _tempo_midi)
             if midi_buffer:
                 st.download_button(
-                    "🎹 Scarica MIDI per Logic", midi_buffer, "loop507_struttura.mid",
+                    "🎹 Scarica MIDI struttura (1 traccia per deck)", midi_buffer, "loop507_struttura.mid",
                     use_container_width=True,
-                    help="MIDI Format 1: traccia conductor (tempo, 4/4, tonalità, marker di sezione e di "
+                    help="NON è la musica del mix: è la struttura (una nota lunga quanto ogni frammento, una traccia per deck). "
+                         "Per batteria/basso/armonia del suono finale usa il MIDI trascritto qui sopra. "
+                         "MIDI Format 1: traccia conductor (tempo, 4/4, tonalità, marker di sezione e di "
                          "battuta 1), una traccia per deck con nome e note lunghe quanto ogni frammento "
                          "(A=C1, B=C#1...). Importa il WAV/MP3 a battuta 1 e imposta il tempo del progetto "
                          "al BPM indicato; il marker 'Battuta 1' dice dove cade il primo downbeat del leader."
