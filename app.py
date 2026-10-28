@@ -20,14 +20,6 @@ except ImportError:
     COMPRESSOR_DISPONIBILE = False
 
 try:
-    import aubio
-    AUBIO_DISPONIBILE = True
-except ImportError:
-    # aubio non e' nei requirements: il terzo metodo di verifica BPM si disattiva da solo.
-    # Se vedi questo messaggio, aggiungi 'aubio' a requirements.txt.
-    AUBIO_DISPONIBILE = False
-
-try:
     from scipy.signal import butter, sosfiltfilt
     SCIPY_DISPONIBILE = True
 except ImportError:
@@ -84,7 +76,7 @@ MIN_SEGMENT_SAMPLES = 256          # ~5ms a 44.1kHz, evita segmenti a lunghezza 
 MAX_SEGMENT_SECONDS = 30           # tetto di sicurezza per singolo segmento
 
 # Versione unica dell'app: usata in preset, report e footer (prima era sparsa in 3 punti con valori diversi)
-APP_VERSION = "5.8"
+APP_VERSION = "5.9"
 DOWNBEAT_MIN_CONFIDENCE = 0.15  # sotto questa confidenza la stima del downbeat viene scartata
 
 # --- Funzioni di Analisi e Taglio ---
@@ -200,28 +192,85 @@ def classifica_rapporto(a, b, tolleranza=0.03):
     return "diverso"
 
 
-def aubio_tempo_estimate(y, sr):
-    """Stima il BPM con aubio (algoritmo di Paul Brossier: onset detection via High Frequency
-    Content, poi tracking del tempo) — tecnica indipendente sia dal beat-tracking dinamico di
-    librosa (usato per tempo_principale) sia dall'autocorrelazione del tempogram (usata da
-    librosa.feature.tempo). Un terzo parere costruito su un principio di rilevamento diverso
-    dagli altri due tende a sbagliare in modo diverso, il che lo rende utile proprio nei casi
-    in cui i primi due concordano ma sono entrambi vittima dello stesso tipo di errore."""
-    if not AUBIO_DISPONIBILE:
-        return None
+IOI_MIN_PROMINENZA = 1.8  # picco migliore / mediana dei candidati: sotto, nessuna pulsazione chiara
+
+
+def ioi_tempo_estimate(y, sr, bpm_min=60.0, bpm_max=200.0, _debug=False):
+    """Terzo parere sul BPM, solo NumPy/SciPy/librosa (sostituisce aubio, che non si compila su
+    Python 3.13). Tecnica nel DOMINIO DEL TEMPO, volutamente diversa dagli altri due metodi:
+    il beat-tracking dinamico e librosa.feature.tempo lavorano sulla PERIODICITA' dell'inviluppo
+    (autocorrelazione), questo invece conta gli ATTACCHI:
+      1) inviluppo HFC (High Frequency Content: energia pesata per la frequenza, che esalta i
+         transienti di kick/rullante/hi-hat — lo stesso principio di rilevamento di aubio) e flusso
+         positivo di quell'inviluppo;
+      2) picchi = onset discreti, con la loro forza;
+      3) istogramma degli intervalli tra TUTTE le coppie di onset entro 2.5s (non solo i
+         consecutivi: Dixon, 2001), pesato dalla forza degli attacchi e levigato;
+      4) per ogni BPM candidato si somma l'istogramma ai multipli del periodo (1x,2x,3x,4x) e,
+         con peso minore, alla sua metà (le suddivisioni): un tempo vero ha picchi a tutti i multipli,
+         una sua ottava sbagliata no, quindi il confronto risolve gli errori d'ottava;
+      5) prior log-normale centrata su 120 BPM (larghezza 1 ottava) per i casi residui.
+    Ritorna il BPM o None se non ci sono abbastanza attacchi o nessun candidato emerge."""
     try:
-        y_mono = np.mean(y, axis=0) if y.ndim == 2 else y
-        y_mono = np.ascontiguousarray(y_mono.astype(np.float32))
-        win_s, hop_s = 1024, 512
-        if len(y_mono) < win_s * 2:
+        y_mono = np.mean(y, axis=0) if getattr(y, 'ndim', 1) == 2 else y
+        max_n = int(120 * sr)  # estratto centrale: oltre 2 minuti non servono, costa solo tempo
+        if len(y_mono) > max_n:
+            a = (len(y_mono) - max_n) // 2
+            y_mono = y_mono[a:a + max_n]
+        n_fft, hop = 1024, 512
+        if len(y_mono) < n_fft * 8:
             return None
-        tempo_o = aubio.tempo("default", win_s, hop_s, sr)
-        total = 0
-        while total + hop_s <= len(y_mono):
-            tempo_o(y_mono[total:total + hop_s])
-            total += hop_s
-        bpm = float(tempo_o.get_bpm())
-        return bpm if bpm > 0 else None
+        S = np.abs(librosa.stft(y_mono.astype(np.float32), n_fft=n_fft, hop_length=hop))
+        k = np.arange(S.shape[0], dtype=np.float32)[:, None]
+        hfc = np.sum((S ** 2) * k, axis=0)
+        hfc = np.log1p(1000.0 * hfc / (np.max(hfc) + 1e-12))     # compressione: attacchi deboli contano
+        flusso = np.maximum(0.0, np.diff(hfc, prepend=hfc[0]))    # solo gli AUMENTI di energia
+        env = np.convolve(flusso, np.ones(3) / 3.0, mode='same')
+        fps = sr / hop
+        from scipy.signal import find_peaks
+        picchi, _ = find_peaks(env, height=float(np.mean(env) + 0.5 * np.std(env)),
+                               distance=max(1, int(0.05 * fps)))
+        if len(picchi) < 12:
+            return None
+        t = picchi / fps
+        a_on = env[picchi]
+        # istogramma IOI (bin da 10ms) fino a 2.5s
+        bin_s = 0.01
+        n_bins = int(2.5 / bin_s) + 1
+        H = np.zeros(n_bins)
+        for i in range(len(t) - 1):
+            j = i + 1
+            while j < len(t) and t[j] - t[i] <= 2.5:
+                b = int(round((t[j] - t[i]) / bin_s))
+                if b < n_bins:
+                    H[b] += np.sqrt(a_on[i] * a_on[j])
+                j += 1
+        if H.sum() <= 0:
+            return None
+        sig = 2  # ~20ms: tollera il leggero jitter degli onset
+        ker = np.exp(-0.5 * (np.arange(-3 * sig, 3 * sig + 1) / sig) ** 2)
+        H = np.convolve(H, ker / ker.sum(), mode='same')
+        H = H / (H.sum() + 1e-12)
+        asse = np.arange(n_bins) * bin_s
+
+        def h(sec):
+            return float(np.interp(sec, asse, H)) if 0.0 < sec <= 2.5 else 0.0
+
+        bpms = np.arange(bpm_min, bpm_max + 0.01, 0.25)
+        punteggi = np.zeros(len(bpms))
+        for idx, bpm in enumerate(bpms):
+            P = 60.0 / bpm
+            s = h(P) + 0.7 * h(2 * P) + 0.5 * h(3 * P) + 0.4 * h(4 * P) + 0.3 * h(P / 2.0)
+            prior = np.exp(-0.5 * (np.log2(bpm / 120.0) / 1.0) ** 2)
+            punteggi[idx] = s * prior
+        best = int(np.argmax(punteggi))
+        if punteggi[best] <= 0:
+            return None
+        # Affidabilita': il picco deve staccarsi dalla mediana dei candidati. Con rumore o materiale
+        # senza pulsazione l'istogramma e' piatto e il "massimo" sarebbe casuale: meglio dire None.
+        if punteggi[best] < IOI_MIN_PROMINENZA * (float(np.median(punteggi)) + 1e-12):
+            return None
+        return (float(bpms[best]), float(punteggi[best] / (np.median(punteggi) + 1e-12))) if _debug else float(bpms[best])
     except Exception:
         return None
 
@@ -230,7 +279,7 @@ def cross_check_tempo(y, sr, tempo_principale):
     """Confronta il BPM principale (beat-tracking dinamico + mediana intervalli, il nostro
     metodo di riferimento) con DUE metodi indipendenti aggiuntivi che usano principi di
     rilevamento diversi tra loro: librosa.feature.tempo (autocorrelazione del tempogram) e
-    aubio (High Frequency Content, algoritmo di Paul Brossier).
+    IOI (istogramma degli intervalli tra onset High-Frequency-Content, nel dominio del tempo).
     - Se entrambi concordano col principale: alta fiducia, nessun avviso necessario.
     - Se ENTRAMBI concordano TRA LORO ma disaccordano dal principale per lo stesso rapporto
       noto (es. 3:2): è un segnale molto più forte — due metodi indipendenti contro uno solo
@@ -239,8 +288,8 @@ def cross_check_tempo(y, sr, tempo_principale):
       esplicitamente invece di far finta che tutto vada bene.
     Ritorna un dict con tutti i dettagli (utile sia per la UI che per il report)."""
     if tempo_principale is None or tempo_principale <= 0:
-        return {"esito": "n/d", "feature_tempo": None, "aubio_tempo": None,
-                "feature_rapporto": None, "aubio_rapporto": None}
+        return {"esito": "n/d", "feature_tempo": None, "ioi_tempo": None,
+                "feature_rapporto": None, "ioi_rapporto": None}
 
     try:
         y_mono = np.mean(y, axis=0) if y.ndim == 2 else y
@@ -251,15 +300,15 @@ def cross_check_tempo(y, sr, tempo_principale):
     except Exception:
         tempo_feature = None
 
-    tempo_aubio = aubio_tempo_estimate(y, sr)
+    tempo_ioi = ioi_tempo_estimate(y, sr)
 
     feature_rapporto = classifica_rapporto(tempo_principale, tempo_feature) if tempo_feature else None
-    aubio_rapporto = classifica_rapporto(tempo_principale, tempo_aubio) if tempo_aubio else None
+    ioi_rapporto = classifica_rapporto(tempo_principale, tempo_ioi) if tempo_ioi else None
 
-    concordi_col_principale = sum(1 for r in [feature_rapporto, aubio_rapporto] if r == "uguale")
+    concordi_col_principale = sum(1 for r in [feature_rapporto, ioi_rapporto] if r == "uguale")
     stesso_disaccordo = (
-        feature_rapporto and aubio_rapporto
-        and feature_rapporto == aubio_rapporto
+        feature_rapporto and ioi_rapporto
+        and feature_rapporto == ioi_rapporto
         and feature_rapporto != "uguale"
     )
 
@@ -275,9 +324,9 @@ def cross_check_tempo(y, sr, tempo_principale):
     return {
         "esito": esito,
         "feature_tempo": round(tempo_feature, 1) if tempo_feature else None,
-        "aubio_tempo": round(tempo_aubio, 1) if tempo_aubio else None,
+        "ioi_tempo": round(tempo_ioi, 1) if tempo_ioi else None,
         "feature_rapporto": feature_rapporto,
-        "aubio_rapporto": aubio_rapporto,
+        "ioi_rapporto": ioi_rapporto,
     }
 
 
@@ -483,9 +532,9 @@ def build_batch_report(results, order, target_bpm, saltate):
         esito = cc.get('esito', 'n/d')
         if esito not in ('n/d', 'confermato (2/2 metodi indipendenti concordano)'):
             cross_info_it = (f"\n    Verifica incrociata: {esito} "
-                              f"(feature.tempo: {cc.get('feature_tempo')} BPM, aubio: {cc.get('aubio_tempo')} BPM)")
+                              f"(feature.tempo: {cc.get('feature_tempo')} BPM, IOI: {cc.get('ioi_tempo')} BPM)")
             cross_info_en = (f"\n    Cross-check: {esito} "
-                              f"(feature.tempo: {cc.get('feature_tempo')} BPM, aubio: {cc.get('aubio_tempo')} BPM)")
+                              f"(feature.tempo: {cc.get('feature_tempo')} BPM, IOI: {cc.get('ioi_tempo')} BPM)")
         righe_it.append(
             f"* {r['name']}\n"
             f"    Originale: {r['tempo']:.2f} BPM — {r['key_nome']} ({r['camelot']})\n"
@@ -2162,7 +2211,7 @@ with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa veloc
                 y = applica_preparazione(y, sr, **prep)
                 key_nome, camelot, _ = detect_key_camelot(y, sr)
                 ambiguita = check_tempo_ambiguity(y, sr, t) if t > 0 else []
-                crosscheck = cross_check_tempo(y, sr, t) if t > 0 else {"esito": "n/d", "feature_tempo": None, "aubio_tempo": None}
+                crosscheck = cross_check_tempo(y, sr, t) if t > 0 else {"esito": "n/d", "feature_tempo": None, "ioi_tempo": None}
                 st.session_state.batch_results.append({
                     'name': bf.name, 'artist': artista, 'tempo': t,
                     'key_nome': key_nome or "n/d", 'camelot': camelot or "?",
@@ -2183,11 +2232,11 @@ with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa veloc
                     esito = cc.get('esito', 'n/d')
                     st.caption(f"🎵 {r['name']} — {r['key_nome']} ({r['camelot']})")
                     if esito.startswith("confermato"):
-                        st.caption(f"✅ Verifica incrociata: {esito} (feature.tempo: {cc.get('feature_tempo')}, aubio: {cc.get('aubio_tempo')})")
+                        st.caption(f"✅ Verifica incrociata: {esito} (feature.tempo: {cc.get('feature_tempo')}, IOI: {cc.get('ioi_tempo')})")
                     elif esito.startswith("probabile errore"):
-                        st.caption(f"🔴 {esito.upper()} — feature.tempo: {cc.get('feature_tempo')} BPM, aubio: {cc.get('aubio_tempo')} BPM. Controlla ad orecchio: probabilmente uno di questi due è quello giusto.")
+                        st.caption(f"🔴 {esito.upper()} — feature.tempo: {cc.get('feature_tempo')} BPM, IOI: {cc.get('ioi_tempo')} BPM. Controlla ad orecchio: probabilmente uno di questi due è quello giusto.")
                     elif esito.startswith("parzialmente"):
-                        st.caption(f"🟡 Verifica incrociata: {esito} (feature.tempo: {cc.get('feature_tempo')}, aubio: {cc.get('aubio_tempo')})")
+                        st.caption(f"🟡 Verifica incrociata: {esito} (feature.tempo: {cc.get('feature_tempo')}, IOI: {cc.get('ioi_tempo')})")
                     if ambiguita:
                         alt_str = ", ".join(f"{bpm} ({nome})" for bpm, nome, _ in ambiguita[:2])
                         st.caption(f"⚠️ Possibile ambiguità ritmica — BPM alternativi plausibili: {alt_str}. Verifica ad orecchio o dal tag del brano.")
