@@ -61,6 +61,14 @@ except ImportError:
     # Se vedi questo messaggio, aggiungi 'matplotlib' a requirements.txt.
     MATPLOTLIB_DISPONIBILE = False
 
+try:
+    import cv2
+    CV2_DISPONIBILE = True
+except ImportError:
+    # opencv non e' nei requirements: l'export del video onda si disattiva da sola.
+    # Se vedi questo messaggio, aggiungi 'opencv-python-headless' a requirements.txt.
+    CV2_DISPONIBILE = False
+
 # --- Configurazione FFmpeg ---
 ffmpeg_bin = shutil.which("ffmpeg")
 if ffmpeg_bin:
@@ -76,7 +84,7 @@ MIN_SEGMENT_SAMPLES = 256          # ~5ms a 44.1kHz, evita segmenti a lunghezza 
 MAX_SEGMENT_SECONDS = 30           # tetto di sicurezza per singolo segmento
 
 # Versione unica dell'app: usata in preset, report e footer (prima era sparsa in 3 punti con valori diversi)
-APP_VERSION = "5.10"
+APP_VERSION = "5.11"
 DOWNBEAT_MIN_CONFIDENCE = 0.15  # sotto questa confidenza la stima del downbeat viene scartata
 
 # --- Funzioni di Analisi e Taglio ---
@@ -1424,6 +1432,8 @@ def invalidate_mix():
         st.session_state.pop(_k, None)
     st.session_state.pop("dj_rendered_by_deck", None)
     st.session_state.pop("mix_is_preview", None)
+    for _k in ("mix_waveform_video", "mix_waveform_video_info", "mix_bar_times", "mix_img_title"):
+        st.session_state.pop(_k, None)
     st.session_state.pop("mix_waveform_image", None)
     st.session_state.audio_report = ""
 
@@ -2074,6 +2084,286 @@ def build_waveform_image(final_y, sr, events=None, title="Loop507 Mix", placemen
 
 
 # =====================================================================================
+# v5.11: VIDEO DELL'ONDA — la stessa "foto" dell'immagine, ma animata e sincronizzata al mix.
+# Solo DSP: frame disegnati con numpy + OpenCV, inviati a ffmpeg (gia' richiesto dall'app) che
+# codifica H.264 + AAC. Nessuna AI, nessun matplotlib per frame (sarebbe lentissimo).
+# =====================================================================================
+_TAB10_HEX = ["1f77b4", "ff7f0e", "2ca02c", "d62728", "9467bd", "8c564b", "e377c2", "7f7f7f", "bcbd22", "17becf"]
+SR_VIDEO = 22050          # per disegnare la forma d'onda basta molto meno del 44.1kHz del mix
+BLOCCO_VIDEO = 64         # campioni per cella dell'inviluppo min/max (~2.9ms)
+
+
+def _hex_bgr(h):
+    return (int(h[4:6], 16), int(h[2:4], 16), int(h[0:2], 16))
+
+
+def _mescola_bgr(c, bg, alpha):
+    """Colore c sopra lo sfondo bg con trasparenza alpha, precalcolato (cosi' niente blending per frame)."""
+    return tuple(int(round(bg[i] * (1.0 - alpha) + c[i] * alpha)) for i in range(3))
+
+
+def _ascii_hud(testo):
+    """I font Hershey di OpenCV non hanno accenti ne' trattini lunghi: li riduciamo ad ASCII."""
+    t = str(testo).replace("\u2014", "-").replace("\u2013", "-")
+    return t.encode("ascii", "ignore").decode("ascii")
+
+
+def _colonne_picchi(env_min, env_max, a, b, ncols):
+    """Min/max per colonna sulle celle [a, b) dell'inviluppo; fuori dal brano = silenzio (zeri)."""
+    n = len(env_max)
+    larg = max(int(b - a), 1)
+    seg_max = np.zeros(larg, dtype=np.float32)
+    seg_min = np.zeros(larg, dtype=np.float32)
+    lo, hi = max(int(a), 0), min(int(b), n)
+    if hi > lo:
+        seg_max[lo - a:hi - a] = env_max[lo:hi]
+        seg_min[lo - a:hi - a] = env_min[lo:hi]
+    rel = np.minimum((np.arange(ncols) * larg / float(ncols)).astype(np.int64), larg - 1)
+    return np.minimum.reduceat(seg_min, rel), np.maximum.reduceat(seg_max, rel)
+
+
+def _poligono_onda(img, x0, mn, mx, yc, amp, colore):
+    """Disegna la forma d'onda (area min/max) come un unico poligono: una chiamata, non una linea per colonna."""
+    if len(mn) == 0:
+        return
+    mx = np.maximum(mx, 0.006)    # spessore minimo: anche il silenzio mostra la linea centrale, come nell'immagine
+    mn = np.minimum(mn, -0.006)
+    xs = np.arange(len(mn), dtype=np.float32) + x0
+    alto = np.stack([xs, yc - mx * amp], axis=1)
+    basso = np.stack([xs[::-1], (yc - mn * amp)[::-1]], axis=1)
+    pts = np.concatenate([alto, basso]).astype(np.int32)
+    cv2.fillPoly(img, [pts], colore, lineType=cv2.LINE_AA)
+
+
+def _linea_tratteggiata_v(img, x, y0, y1, colore, passo=6):
+    for y in range(int(y0), int(y1), passo * 2):
+        cv2.line(img, (x, y), (x, min(y + passo, int(y1))), colore, 1)
+
+
+def build_waveform_video(mp3_bytes, sr_eventi, placements=None, events=None, title="Loop507 Mix",
+                         bar_times=None, section_times=None, larghezza=960, altezza=540, fps=24,
+                         max_sec=None, finestra_sec=8.0, progress_cb=None):
+    """Video MP4 dell'immagine-onda: in alto la panoramica di TUTTO il mix (come il PNG) con il cursore che
+    avanza; in basso la finestra che scorre (+-4s) con fasce dei deck, battute e sezioni; la linea del
+    cursore pulsa a ogni battuta del leader; sotto, VU-meter e deck attivi. Audio = l'MP3 esatto del mix.
+    Ritorna (bytes_mp4, messaggio): se qualcosa non va, bytes_mp4 e' None e il messaggio dice cosa."""
+    if not CV2_DISPONIBILE:
+        return None, "OpenCV non disponibile: aggiungi 'opencv-python-headless' a requirements.txt."
+    if not ffmpeg_bin:
+        return None, "FFmpeg non trovato."
+    import subprocess
+
+    # --- 1) audio del mix -> mono 22.05kHz float, normalizzato per il disegno ---
+    try:
+        seg = AudioSegment.from_file(BytesIO(mp3_bytes))
+        seg = seg.set_frame_rate(SR_VIDEO).set_channels(1)
+        y = np.array(seg.get_array_of_samples()).astype(np.float32) / float(2 ** (8 * seg.sample_width - 1))
+    except Exception as e:
+        return None, f"Impossibile decodificare l'audio del mix: {e}"
+    if len(y) < SR_VIDEO // 2:
+        return None, "Mix troppo corto per un video."
+    durata = len(y) / float(SR_VIDEO)
+    dur_out = min(durata, float(max_sec)) if max_sec else durata
+    n_frames = max(int(dur_out * fps), 1)
+
+    picco = float(np.max(np.abs(y))) or 1.0
+    n_blk = len(y) // BLOCCO_VIDEO
+    blocchi = (y[:n_blk * BLOCCO_VIDEO] / picco).reshape(n_blk, BLOCCO_VIDEO)
+    env_min, env_max = blocchi.min(axis=1), blocchi.max(axis=1)
+    blk_al_sec = SR_VIDEO / float(BLOCCO_VIDEO)
+
+    # RMS per frame (cumsum dei quadrati: vettoriale), normalizzato sul 95° percentile
+    csum = np.concatenate([[0.0], np.cumsum(y.astype(np.float64) ** 2)])
+    centri = (np.arange(n_frames) / float(fps) * SR_VIDEO).astype(np.int64)
+    meta = int(0.03 * SR_VIDEO)
+    i0, i1 = np.clip(centri - meta, 0, len(y)), np.clip(centri + meta, 0, len(y))
+    rms = np.sqrt(np.maximum(csum[i1] - csum[i0], 0.0) / np.maximum(i1 - i0, 1))
+    rms = np.clip(rms / (np.percentile(rms, 95) + 1e-9), 0.0, 1.0)
+
+    # --- 2) dati di struttura ---
+    placements = placements or []
+    if placements:
+        ps = np.array([p['start'] / float(sr_eventi) for p in placements], dtype=np.float64)
+        pe = np.array([(p['start'] + p['length']) / float(sr_eventi) for p in placements], dtype=np.float64)
+        pdk = [p['deck'] for p in placements]
+    elif events:
+        ps = np.array([s / float(sr_eventi) for s, _ in events], dtype=np.float64)
+        pe = ps + 0.25
+        pdk = [d for _, d in events]
+    else:
+        ps = pe = np.zeros(0)
+        pdk = []
+    decks = sorted(set(pdk))
+    bg = (245, 247, 247)  # #f7f7f5 in BGR, lo stesso sfondo dell'immagine
+    colori = {d: _hex_bgr(_TAB10_HEX[i % 10]) for i, d in enumerate(decks)}
+    c_band = {d: _mescola_bgr(c, bg, 0.22) for d, c in colori.items()}
+    c_band_on = {d: _mescola_bgr(c, bg, 0.55) for d, c in colori.items()}
+    pdk_idx = np.array([decks.index(d) for d in pdk], dtype=np.int32) if pdk else np.zeros(0, dtype=np.int32)
+    bt = np.array(sorted(bar_times), dtype=np.float64) if bar_times else np.zeros(0)
+    st_ = np.array(sorted(section_times), dtype=np.float64) if section_times else np.zeros(0)
+    rosso, scuro, grigio = (43, 57, 192), (43, 43, 43), (150, 150, 150)  # BGR: #c0392b, #2b2b2b
+
+    # --- 3) layout ---
+    W, H = int(larghezza) // 2 * 2, int(altezza) // 2 * 2
+    m = max(W // 40, 12)
+    PW = W - 2 * m
+    y_ov, h_ov = int(H * 0.095), int(H * 0.27)
+    y_zm = y_ov + h_ov + int(H * 0.035)
+    h_zm = int(H * 0.40)
+    y_info = y_zm + h_zm + int(H * 0.045)
+    y_meter = y_info + int(H * 0.025)
+    y_leg = H - int(H * 0.06)
+    fs = H / 540.0
+
+    # --- 4) panoramica statica (due versioni: onda "da suonare" chiara e "gia' suonata" scura) ---
+    mn_ov, mx_ov = _colonne_picchi(env_min, env_max, 0, n_blk, PW)
+
+    def _panoramica(colore_onda):
+        img = np.full((h_ov, PW, 3), bg, dtype=np.uint8)
+        if len(bt) and len(bt) <= 400:
+            for t in bt:
+                if 0 <= t <= durata:
+                    cv2.line(img, (int(t / durata * PW), 0), (int(t / durata * PW), h_ov), (225, 225, 225), 1)
+        for k in range(len(ps)):
+            x0, x1 = int(ps[k] / durata * PW), max(int(pe[k] / durata * PW), int(ps[k] / durata * PW) + 1)
+            cv2.rectangle(img, (x0, 0), (x1, h_ov), c_band[decks[pdk_idx[k]]], -1)
+        _poligono_onda(img, 0, mn_ov, mx_ov, h_ov // 2, h_ov * 0.46, colore_onda)
+        for i, t in enumerate(st_):
+            if 0 <= t <= durata:
+                x = int(t / durata * PW)
+                _linea_tratteggiata_v(img, x, 0, h_ov, rosso)
+                cv2.putText(img, f"S{i + 1}", (x + 3, int(12 * fs) + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.38 * fs, rosso, 1, cv2.LINE_AA)
+        return img
+
+    ov_chiaro, ov_scuro = _panoramica((185, 185, 185)), _panoramica(scuro)
+
+    # sfondo fisso del frame: titolo, cornici, legenda
+    base = np.full((H, W, 3), bg, dtype=np.uint8)
+    cv2.putText(base, _ascii_hud(title), (m, int(H * 0.058)), cv2.FONT_HERSHEY_SIMPLEX, 0.62 * fs, scuro, 1, cv2.LINE_AA)
+    cv2.rectangle(base, (m - 1, y_ov - 1), (m + PW, y_ov + h_ov), (205, 205, 205), 1)
+    cv2.rectangle(base, (m - 1, y_zm - 1), (m + PW, y_zm + h_zm), (205, 205, 205), 1)
+    cv2.putText(base, "LOOP507 // HYPER-MIXER", (m, H - int(H * 0.012)), cv2.FONT_HERSHEY_SIMPLEX, 0.36 * fs, grigio, 1, cv2.LINE_AA)
+
+    # --- 5) ffmpeg: frame grezzi su stdin + audio dall'MP3 ---
+    tmpdir = tempfile.mkdtemp(prefix="loop507_vid_")
+    mp3_path, out_path, log_path = (os.path.join(tmpdir, n) for n in ("mix.mp3", "out.mp4", "ffmpeg.log"))
+    try:
+        with open(mp3_path, "wb") as f:
+            f.write(mp3_bytes)
+        cmd = [ffmpeg_bin, "-y", "-loglevel", "error",
+               "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", str(fps), "-i", "-",
+               "-i", mp3_path]
+        if max_sec:
+            cmd += ["-t", f"{dur_out:.3f}"]
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", out_path]
+        logf = open(log_path, "wb")
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=logf)
+        n_win = max(int(finestra_sec * blk_al_sec), PW // 2)
+        try:
+            for fi in range(n_frames):
+                t = fi / float(fps)
+                fr = base.copy()
+
+                # panoramica + cursore
+                px = min(int(t / durata * PW), PW - 1)
+                fr[y_ov:y_ov + h_ov, m:m + PW] = ov_chiaro
+                fr[y_ov:y_ov + h_ov, m:m + px] = ov_scuro[:, :px]
+                cv2.line(fr, (m + px, y_ov), (m + px, y_ov + h_ov), rosso, 2)
+
+                # finestra che scorre
+                t0, t1 = t - finestra_sec / 2.0, t + finestra_sec / 2.0
+                pane = np.full((h_zm, PW, 3), bg, dtype=np.uint8)
+                xs_of = lambda tt: (tt - t0) / finestra_sec * PW
+                attivi = set()
+                vis = np.nonzero((pe > t0) & (ps < t1))[0]
+                for k in vis:
+                    d = decks[pdk_idx[k]]
+                    on = ps[k] <= t < pe[k]
+                    if on:
+                        attivi.add(d)
+                    cv2.rectangle(pane, (int(xs_of(ps[k])), 0), (max(int(xs_of(pe[k])), int(xs_of(ps[k])) + 1), h_zm),
+                                  c_band_on[d] if on else c_band[d], -1)
+                if len(bt):
+                    for tb in bt[(bt >= t0) & (bt <= t1)]:
+                        cv2.line(pane, (int(xs_of(tb)), 0), (int(xs_of(tb)), h_zm), (215, 215, 215), 1)
+                for i in np.nonzero((st_ >= t0) & (st_ <= t1))[0]:
+                    x = int(xs_of(st_[i]))
+                    _linea_tratteggiata_v(pane, x, 0, h_zm, rosso)
+                    cv2.putText(pane, f"S{i + 1}", (x + 4, int(14 * fs) + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.42 * fs, rosso, 1, cv2.LINE_AA)
+                a = int(t0 * blk_al_sec)
+                mn, mx = _colonne_picchi(env_min, env_max, a, a + n_win, PW)
+                _poligono_onda(pane, 0, mn[:PW // 2], mx[:PW // 2], h_zm // 2, h_zm * 0.46, scuro)
+                _poligono_onda(pane, PW // 2, mn[PW // 2:], mx[PW // 2:], h_zm // 2, h_zm * 0.46, (120, 120, 120))
+
+                # cursore: pulsa sulle battute
+                flash = 0.0
+                if len(bt):
+                    j = np.searchsorted(bt, t, side="right") - 1
+                    if j >= 0:
+                        flash = max(0.0, 1.0 - (t - bt[j]) / 0.14)
+                cv2.line(pane, (PW // 2, 0), (PW // 2, h_zm), rosso, 2 + int(round(4 * flash)))
+                fr[y_zm:y_zm + h_zm, m:m + PW] = pane
+
+                # testi: tempo, battuta, sezione
+                mm, ss = divmod(t, 60.0)
+                tm, ts = divmod(durata, 60.0)
+                testo_t = f"{int(mm):02d}:{ss:04.1f} / {int(tm):02d}:{ts:04.1f}"
+                (tw, _), _ = cv2.getTextSize(testo_t, cv2.FONT_HERSHEY_SIMPLEX, 0.55 * fs, 1)
+                cv2.putText(fr, testo_t, (W - m - tw, int(H * 0.058)), cv2.FONT_HERSHEY_SIMPLEX, 0.55 * fs, scuro, 1, cv2.LINE_AA)
+                bar_n = int(np.searchsorted(bt, t, side="right")) if len(bt) else 0
+                sez_n = int(np.searchsorted(st_, t, side="right")) if len(st_) else 0
+                info = (f"BAR {bar_n}" if len(bt) else "BAR -") + f"   SEZ {sez_n if len(st_) else '-'}"
+                cv2.putText(fr, info, (m, y_info), cv2.FONT_HERSHEY_SIMPLEX, 0.45 * fs, scuro, 1, cv2.LINE_AA)
+
+                # VU-meter
+                cv2.rectangle(fr, (m, y_meter), (m + PW, y_meter + max(int(6 * fs), 4)), (225, 225, 225), -1)
+                cv2.rectangle(fr, (m, y_meter), (m + int(rms[fi] * PW), y_meter + max(int(6 * fs), 4)),
+                              colori[sorted(attivi)[0]] if attivi else scuro, -1)
+
+                # legenda deck: pieno = sta suonando adesso
+                x = m
+                for d in decks:
+                    lato = max(int(12 * fs), 8)
+                    if d in attivi:
+                        cv2.rectangle(fr, (x, y_leg), (x + lato, y_leg + lato), colori[d], -1)
+                    else:
+                        cv2.rectangle(fr, (x, y_leg), (x + lato, y_leg + lato), colori[d], 1)
+                    cv2.putText(fr, f"DECK {str(d).upper()}", (x + lato + 5, y_leg + lato - 1),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.40 * fs, scuro, 1, cv2.LINE_AA)
+                    x += int(88 * fs)
+
+                proc.stdin.write(fr.tobytes())
+                if progress_cb and fi % 12 == 0:
+                    progress_cb(min(fi / float(n_frames), 1.0))
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+        rc = proc.wait()
+        logf.close()
+        if rc != 0 or not os.path.exists(out_path):
+            try:
+                with open(log_path, "rb") as f:
+                    err = f.read().decode("utf-8", "ignore").strip()[-400:]
+            except Exception:
+                err = ""
+            return None, f"ffmpeg ha fallito (codice {rc}). {err}"
+        with open(out_path, "rb") as f:
+            dati = f.read()
+        if progress_cb:
+            progress_cb(1.0)
+        return dati, f"Video {W}x{H} @ {fps}fps, {dur_out:.1f}s, {len(dati) / 1e6:.1f} MB"
+    except Exception as e:
+        return None, f"Errore nel rendering del video: {e}"
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# =====================================================================================
 # v5.10: MIDI TRASCRITTO DALL'AUDIO DEL MIX (batteria + basso + armonia), solo DSP
 # =====================================================================================
 # Note General MIDI per la batteria (canale 10)
@@ -2717,7 +3007,7 @@ with st.expander("📦 Batch BPM Matcher — porta più tracce alla stessa veloc
     if st.session_state.batch_zip:
         st.download_button(
             "📥 Scarica ZIP con le tracce allineate", st.session_state.batch_zip,
-            "loop507_batch_allineato.zip", mime="application/zip", use_container_width=True
+            "loop507_batch_allineato.zip", mime="application/zip", width="stretch"
         )
 
 # Firma delle impostazioni di preparazione (conta solo cio' che e' davvero attivo: un target LUFS
@@ -2807,7 +3097,7 @@ for row_idx in [0, 4]:
                     st.session_state.decks[k]['tempo'] = manual_bpm
                     st.audio(up)
 
-                    if st.button(f"🎛️ Esporta Renderizzato {k.upper()}", key=f"export_rend_{k}", use_container_width=True,
+                    if st.button(f"🎛️ Esporta Renderizzato {k.upper()}", key=f"export_rend_{k}", width="stretch",
                                  help="Il deck così com'è DOPO l'ultima elaborazione (taglio, time-stretch, allineamento DJ Remix)."):
                         with st.spinner(f"Esporto Deck {k.upper()} (renderizzato)..."):
                             dj_rendered = st.session_state.get('dj_rendered_by_deck')
@@ -2834,7 +3124,7 @@ for row_idx in [0, 4]:
                     if st.session_state.get(f"exported_rend_{k}"):
                         st.download_button(
                             f"📥 Scarica Renderizzato {k.upper()}.mp3", st.session_state[f"exported_rend_{k}"],
-                            f"loop507_deck_{k}_renderizzato.mp3", key=f"dl_rend_{k}", use_container_width=True
+                            f"loop507_deck_{k}_renderizzato.mp3", key=f"dl_rend_{k}", width="stretch"
                         )
 
                     if st.session_state.segments:
@@ -3856,6 +4146,11 @@ if active_decks:
                     st.session_state.mix_waveform_image = build_waveform_image(
                         final_y, ref_sr, dj_events, title=titolo_img, placements=placements,
                         bar_times=_bar_times, section_times=mix_sections_sec)
+                    # Dati per il video onda (generato a richiesta dopo il mix)
+                    st.session_state.mix_bar_times = _bar_times
+                    st.session_state.mix_img_title = titolo_img
+                    st.session_state.pop('mix_waveform_video', None)
+                    st.session_state.pop('mix_waveform_video_info', None)
 
 if st.session_state.get('mix_ready'):
     st.divider()
@@ -3864,7 +4159,51 @@ if st.session_state.get('mix_ready'):
         st.warning("⚡ Questa è un'ANTEPRIMA veloce (~15s) — disattiva 'Modalità Anteprima' e rigenera per il mix completo.")
     st.audio(st.session_state.mix_ready)
     if st.session_state.get('mix_waveform_image'):
-        st.image(st.session_state.mix_waveform_image, use_container_width=True)
+        st.image(st.session_state.mix_waveform_image, width="stretch")
+    # --- VIDEO dell'onda: la stessa immagine, animata e a tempo con l'audio ---
+    with st.expander("🎬 Video dell'onda (come l'immagine, animato e a tempo con l'audio)", expanded=False):
+        if not CV2_DISPONIBILE:
+            st.caption("🎬 Video non disponibile: aggiungi 'opencv-python-headless' a requirements.txt.")
+        else:
+            st.caption(
+                "In alto la panoramica di tutto il mix con il cursore che avanza; in basso la finestra che scorre "
+                "(±4 s) con le fasce colorate dei deck, le battute del leader e le sezioni; il cursore pulsa a ogni "
+                "battuta. Audio = l'MP3 del mix. Per provare lo stile usa 'Anteprima (30 s)': il rendering è "
+                "più veloce della durata del video, ma su Streamlit Cloud un mix lungo in HD può richiedere minuti."
+            )
+            _v1, _v2, _v3 = st.columns(3)
+            with _v1:
+                _ris = st.selectbox("Risoluzione", ["854x480", "960x540", "1280x720"], index=1, key="vid_ris")
+            with _v2:
+                _fps = st.selectbox("Fotogrammi/s", [24, 30], index=0, key="vid_fps")
+            with _v3:
+                _durv = st.selectbox("Durata", ["Anteprima (30 s)", "Primi 90 s", "Intero mix"], index=0, key="vid_dur")
+            if st.button("🎬 Genera video onda", width="stretch", key="vid_btn"):
+                _w, _h = (int(v) for v in _ris.split("x"))
+                _max = {"Anteprima (30 s)": 30, "Primi 90 s": 90}.get(_durv)
+                _barra = st.progress(0.0, text="Renderizzo i fotogrammi...")
+                _dati_v, _msg_v = build_waveform_video(
+                    st.session_state.mix_ready.getvalue(), st.session_state.get('mix_events_sr', TARGET_SR),
+                    placements=st.session_state.get('mix_placements') or None,
+                    events=st.session_state.get('mix_events') or None,
+                    title=st.session_state.get('mix_img_title', "Loop507 Mix"),
+                    bar_times=st.session_state.get('mix_bar_times'),
+                    section_times=st.session_state.get('mix_sections_sec'),
+                    larghezza=_w, altezza=_h, fps=_fps, max_sec=_max,
+                    progress_cb=lambda f: _barra.progress(float(f), text=f"Renderizzo i fotogrammi... {int(f * 100)}%"))
+                _barra.empty()
+                if _dati_v:
+                    st.session_state.mix_waveform_video = _dati_v
+                    st.session_state.mix_waveform_video_info = _msg_v
+                else:
+                    st.session_state.pop('mix_waveform_video', None)
+                    st.error(f"🎬 {_msg_v}")
+            if st.session_state.get('mix_waveform_video'):
+                st.video(st.session_state.mix_waveform_video, format="video/mp4")
+                st.caption(st.session_state.get('mix_waveform_video_info', ""))
+                st.download_button("🎬 Scarica Video Onda (MP4)", st.session_state.mix_waveform_video,
+                                   "loop507_waveform.mp4", mime="video/mp4", width="stretch")
+
     # --- MIDI della MUSICA del mix (batteria + basso + armonia), trascritto dall'audio ---
     if st.session_state.get('mix_ready') is not None:
         with st.expander("🥁 MIDI della musica del mix (batteria + basso + armonia)", expanded=True):
@@ -3885,7 +4224,7 @@ if st.session_state.get('mix_ready'):
                                      help="Aggancia gli attacchi alla griglia del tempo (se entro il 40% del passo). "
                                           "Utile se il BPM è giusto; altrimenti lascialo spento e quantizza in Logic.")
             if st.session_state.get('mix_midi_trascritto') is None:
-                if st.button("🎼 Genera MIDI dal suono del mix", use_container_width=True, key="trasc_btn"):
+                if st.button("🎼 Genera MIDI dal suono del mix", width="stretch", key="trasc_btn"):
                     with st.spinner("Trascrivo batteria, basso e armonia dal mix..."):
                         _seg = AudioSegment.from_file(BytesIO(st.session_state.mix_ready.getvalue()))
                         _seg = _seg.set_frame_rate(SR_TRASCRIZIONE).set_channels(1)
@@ -3909,7 +4248,7 @@ if st.session_state.get('mix_ready'):
                 _cont = st.session_state.get('mix_midi_conteggi') or {}
                 st.download_button("🎹 Scarica MIDI del mix (batteria + basso + armonia)",
                                    st.session_state.mix_midi_trascritto, "loop507_mix_trascritto.mid",
-                                   mime="audio/midi", use_container_width=True)
+                                   mime="audio/midi", width="stretch")
                 st.caption(f"Trascritti: {_cont.get('kick', 0)} kick, {_cont.get('rullante', 0)} rullanti, "
                            f"{_cont.get('hihat', 0)} hi-hat, {_cont.get('basso', 0)} note di basso, "
                            f"{_cont.get('armonia', 0)} note di armonia · tempo {_cont.get('bpm', 0):.1f} BPM")
@@ -3926,14 +4265,14 @@ if st.session_state.get('mix_ready'):
         with col_w1:
             if st.session_state.get('mix_wav24') is not None:
                 st.download_button("💽 Scarica Mix WAV 24-bit", st.session_state.mix_wav24,
-                                   "loop507_custom_mix_24bit.wav", mime="audio/wav", use_container_width=True)
+                                   "loop507_custom_mix_24bit.wav", mime="audio/wav", width="stretch")
             else:
                 st.caption("💽 WAV 24-bit: attiva «Esporta anche WAV 24-bit» nella barra laterale e rigenera.")
         with col_w2:
             _n_stem = len({p['deck'] for p in _pl} | ({_ld['deck']} if _ld else set()))
             _mb = _n_stem * st.session_state.get('mix_total_samples', 0) / TARGET_SR * TARGET_SR * 2 * 3 / 1e6
             if st.session_state.get('mix_stems_zip') is None:
-                if st.button(f"🎛️ Prepara stem per deck ({_n_stem} file WAV 24-bit, ~{_mb:.0f} MB)", use_container_width=True,
+                if st.button(f"🎛️ Prepara stem per deck ({_n_stem} file WAV 24-bit, ~{_mb:.0f} MB)", width="stretch",
                              help="Un WAV per deck, tutti lunghi quanto il mix e allineati allo stesso campione 0: "
                                   "trascinali in Logic sulla stessa posizione e si sommano al mix. Sono 'dry' (senza "
                                   "compressione). Con mix lunghi pesano molto: usa l'anteprima per provare."):
@@ -3948,17 +4287,17 @@ if st.session_state.get('mix_ready'):
                     st.rerun()
             else:
                 st.download_button("📦 Scarica Stem (ZIP)", st.session_state.mix_stems_zip,
-                                   "loop507_stem.zip", mime="application/zip", use_container_width=True)
+                                   "loop507_stem.zip", mime="application/zip", width="stretch")
 
     col_d1, col_d2, col_d3, col_d4, col_d5 = st.columns(5)
     with col_d1:
-        st.download_button("📥 Scarica Mix MP3", st.session_state.mix_ready, "loop507_custom_mix.mp3", use_container_width=True)
+        st.download_button("📥 Scarica Mix MP3", st.session_state.mix_ready, "loop507_custom_mix.mp3", width="stretch")
     with col_d2:
-        st.download_button("📄 Scarica Report Audio", st.session_state.audio_report, "audio_report.txt", use_container_width=True)
+        st.download_button("📄 Scarica Report Audio", st.session_state.audio_report, "audio_report.txt", width="stretch")
     with col_d3:
         st.download_button(
             "🎲 Scarica Preset (seed)", st.session_state.get('mix_preset', '{}'),
-            "loop507_preset.json", use_container_width=True,
+            "loop507_preset.json", width="stretch",
             help="Contiene il seed e i parametri usati: ricaricalo per riprovare a ritrovare questo mix."
         )
     with col_d4:
@@ -3980,7 +4319,7 @@ if st.session_state.get('mix_ready'):
             if midi_buffer:
                 st.download_button(
                     "🎹 Scarica MIDI struttura (1 traccia per deck)", midi_buffer, "loop507_struttura.mid",
-                    use_container_width=True,
+                    width="stretch",
                     help="NON è la musica del mix: è la struttura (una nota lunga quanto ogni frammento, una traccia per deck). "
                          "Per batteria/basso/armonia del suono finale usa il MIDI trascritto qui sopra. "
                          "MIDI Format 1: traccia conductor (tempo, 4/4, tonalità, marker di sezione e di "
@@ -3996,7 +4335,7 @@ if st.session_state.get('mix_ready'):
         if st.session_state.get('mix_waveform_image'):
             st.download_button(
                 "🖼️ Scarica Immagine Onda", st.session_state.mix_waveform_image,
-                "loop507_waveform.png", mime="image/png", use_container_width=True,
+                "loop507_waveform.png", mime="image/png", width="stretch",
                 help="Forma d'onda del mix con marcatori colorati per deck nei punti di taglio/overlay."
             )
         else:
