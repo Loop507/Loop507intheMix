@@ -85,6 +85,7 @@ MAX_SEGMENT_SECONDS = 30           # tetto di sicurezza per singolo segmento
 
 # Versione unica dell'app: usata in preset, report e footer (prima era sparsa in 3 punti con valori diversi)
 APP_VERSION = "5.11"
+NOME_BASE_OUT = "loop507_custom_mix"  # unico nome base per MP3, video e report (cambialo solo qui)
 DOWNBEAT_MIN_CONFIDENCE = 0.15  # sotto questa confidenza la stima del downbeat viene scartata
 
 # --- Funzioni di Analisi e Taglio ---
@@ -4074,12 +4075,12 @@ if active_decks:
   Generated on: {ts_audio}
 ╚════════════════════════════════════════════════════════════════╝
 
-[AUDIO_RECONSTRUCTION_LOG] // VOL_01 // MP3 // 320kbps // STEREO
+[AUDIO_RECONSTRUCTION_LOG] // VOL_01
 
 ═══════════════════ ITALIANO ═══════════════════
 
 :: ENGINE: hyper_mixer_loop507 [v{APP_VERSION}]
-:: ANALISI: Beat Tracking (Librosa) / RMS Envelope / Onset Detection
+:: ANALISI: Beat Tracking / RMS Envelope / Onset Detection
 :: STILE: Audio-Glitch / Granular Synthesis
 :: PROCESSO: {processo_it}
 
@@ -4098,7 +4099,7 @@ if active_decks:
 ═══════════════════ ENGLISH ═══════════════════
 
 :: ENGINE: hyper_mixer_loop507 [v{APP_VERSION}]
-:: ANALYSIS: Beat Tracking (Librosa) / RMS Envelope / Onset Detection
+:: ANALYSIS: Beat Tracking / RMS Envelope / Onset Detection
 :: STYLE: Audio-Glitch / Granular Synthesis
 :: PROCESS: {processo_en}
 
@@ -4116,7 +4117,7 @@ if active_decks:
 
 > Regia e Algoritmo / Direction & Algorithm: Loop507
 
-#Loop507 #AudioGlitch #SoundDesign #GranularSynthesis #ExperimentalMusic
+#AudioGlitch #SoundDesign #GranularSynthesis #ExperimentalMusic
 #AudioDecomposition #NoiseArt #SignalCorruption #RecursiveCollapse
 """
                     st.session_state.mix_ready = out
@@ -4202,7 +4203,7 @@ if st.session_state.get('mix_ready'):
                 st.video(st.session_state.mix_waveform_video, format="video/mp4")
                 st.caption(st.session_state.get('mix_waveform_video_info', ""))
                 st.download_button("🎬 Scarica Video Onda (MP4)", st.session_state.mix_waveform_video,
-                                   "loop507_waveform.mp4", mime="video/mp4", width="stretch")
+                                   f"{NOME_BASE_OUT}.mp4", mime="video/mp4", width="stretch")
 
     # --- MIDI della MUSICA del mix (batteria + basso + armonia), trascritto dall'audio ---
     if st.session_state.get('mix_ready') is not None:
@@ -4291,9 +4292,9 @@ if st.session_state.get('mix_ready'):
 
     col_d1, col_d2, col_d3, col_d4, col_d5 = st.columns(5)
     with col_d1:
-        st.download_button("📥 Scarica Mix MP3", st.session_state.mix_ready, "loop507_custom_mix.mp3", width="stretch")
+        st.download_button("📥 Scarica Mix MP3", st.session_state.mix_ready, f"{NOME_BASE_OUT}.mp3", width="stretch")
     with col_d2:
-        st.download_button("📄 Scarica Report Audio", st.session_state.audio_report, "audio_report.txt", width="stretch")
+        st.download_button("📄 Scarica Report Audio", st.session_state.audio_report, f"{NOME_BASE_OUT}.txt", width="stretch")
     with col_d3:
         st.download_button(
             "🎲 Scarica Preset (seed)", st.session_state.get('mix_preset', '{}'),
