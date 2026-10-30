@@ -1,12 +1,13 @@
-streamlit
+streamlit>=1.50
 librosa
+numpy
+scipy
+soundfile
 pydub
 audioop-lts; python_version >= "3.13"
-numpy
 mido
-scipy
-pyloudnorm
-matplotlib
 mutagen
+pyloudnorm
 audiocomplib
-soundfile
+matplotlib
+opencv-python-headless
